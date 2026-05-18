@@ -1253,6 +1253,117 @@ culture-independent string (e.g., `nameof(MyCodeFix) + ".AddUsing"`) for
 Code fixes should make the smallest safe change. Avoid rewriting unrelated
 syntax or normalizing an entire document when only one node needs to change.
 
+### Custom refactorings without diagnostics
+
+Use a `CodeRefactoringProvider` when the source code is already valid and no
+diagnostic should be reported. A `CodeFixProvider` is diagnostic-driven: it is
+invoked for diagnostics that already exist and receives those diagnostics in
+`RegisterCodeFixesAsync`. A `CodeRefactoringProvider` is selection- and
+caret-driven: Visual Studio asks it whether one or more `CodeAction` entries are
+available at the current location, even when the code has no squiggle.
+
+Official references:
+
+- Microsoft Learn, [`CodeRefactoringProvider`](https://learn.microsoft.com/dotnet/api/microsoft.codeanalysis.coderefactorings.coderefactoringprovider?view=roslyn-dotnet-5.0.0):
+  inherit this type to provide source code refactorings and export the provider
+  so the host can offer refactorings in the UI.
+- Microsoft Learn, [Quick Actions in Visual Studio](https://learn.microsoft.com/visualstudio/ide/find-and-fix-code-errors?view=visualstudio#use-quick-actions-to-fix-or-refactor-code):
+  Quick Actions and Refactorings are surfaced through the light bulb / screwdriver
+  UI and the `Ctrl+.` menu.
+
+Typical shape:
+
+```csharp
+[ExportCodeRefactoringProvider(LanguageNames.CSharp, Name = nameof(MyRefactoringProvider))]
+[Shared]
+internal sealed class MyRefactoringProvider : CodeRefactoringProvider
+{
+    public override async Task ComputeRefactoringsAsync(CodeRefactoringContext context)
+    {
+        var document = context.Document;
+        var cancellationToken = context.CancellationToken;
+        var root = await document
+            .GetSyntaxRootAsync(cancellationToken)
+            .ConfigureAwait(false);
+
+        if (root is null)
+        {
+            return;
+        }
+
+        var node = root.FindNode(context.Span);
+        if (!CanRefactor(node))
+        {
+            return;
+        }
+
+        var action = CodeAction.Create(
+            "Apply custom refactoring",
+            ct => ApplyRefactoring(document, node, ct),
+            equivalenceKey: nameof(MyRefactoringProvider));
+
+        context.RegisterRefactoring(action);
+    }
+
+    private static bool CanRefactor(SyntaxNode node)
+    {
+        // Check the selection, syntax shape, and semantic constraints.
+        return true;
+    }
+
+    private static Task<Document> ApplyRefactoring(
+        Document document,
+        SyntaxNode node,
+        CancellationToken cancellationToken)
+    {
+        // Return a changed Document or Solution, just like a code fix.
+        throw new NotImplementedException();
+    }
+}
+```
+
+Practical rules:
+
+- Put refactoring providers in the Workspaces/IDE-facing assembly, not in the
+  compiler-only analyzer assembly. They use MEF (`ExportCodeRefactoringProvider`)
+  and `Microsoft.CodeAnalysis.Workspaces.Common`, the same broad host surface as
+  code fixes.
+- Register a `CodeAction` with `context.RegisterRefactoring(...)`; do not create
+  a hidden diagnostic just to make a code fix appear. Hidden diagnostics are
+  appropriate only when there is still an analyzer rule and a diagnostic contract
+  to configure or suppress.
+- Keep `ComputeRefactoringsAsync` cheap. It may be called often while the user
+  moves the caret or changes the selection, so filter quickly by span and syntax
+  before doing semantic work.
+- Use stable, culture-independent `equivalenceKey` values for actions that can
+  participate in refactor-all or preview grouping; keep the user-facing action
+  title localizable.
+- Return updated `Document` or `Solution` values from the action delegate. Like
+  code fixes, refactorings do not mutate the editor buffer directly.
+
+#### Keyboard shortcuts for custom refactorings in Visual Studio
+
+Visual Studio exposes custom `CodeRefactoringProvider` actions through the
+general **Quick Actions and Refactorings** UI. Users can assign keyboard
+shortcuts to Visual Studio commands through **Tools** > **Options** >
+**Environment** > **Keyboard** (see Microsoft Learn, [Identify and customize
+keyboard shortcuts in Visual Studio](https://learn.microsoft.com/visualstudio/ide/identifying-and-customizing-keyboard-shortcuts-in-visual-studio?view=visualstudio)),
+but an individual Roslyn `CodeAction` from a `CodeRefactoringProvider` is not a
+standalone Visual Studio command with its own stable command ID.
+
+Consequences:
+
+- Users can bind or rebind the shortcut that opens the Quick Actions menu (for
+  example, the default `Ctrl+.` command shown in the Visual Studio Quick Actions
+  documentation), then choose the custom refactoring from that menu.
+- Users generally cannot bind a shortcut directly to one specific custom Roslyn
+  refactoring action shipped only as a `CodeRefactoringProvider`.
+- If a dedicated shortcut is required, ship a separate Visual Studio extension
+  command (for example, a VSPackage / VisualStudio.Extensibility command) and
+  bind that command through VS command infrastructure. The command can then call
+  shared transformation code, but that is a Visual Studio extension feature, not
+  analyzer-package metadata.
+
 ### Fix All in Document/Project/Solution
 
 Your `CodeFixProvider` should heavily prioritize overriding
