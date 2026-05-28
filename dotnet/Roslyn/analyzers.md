@@ -38,6 +38,7 @@ for building and reviewing a detailed guide about desiging analyzers. Here's the
 - [25. Dataflow analysis framework](#25-dataflow-analysis-framework)
 - [26. Porting Legacy Rules (FxCop/Binary)](#26-porting-legacy-rules-fxcopbinary)
 - [27. Consumer-side suppression](#27-consumer-side-suppression)
+- [28. Typical misuses and antipatterns](#28-typical-misuses-and-antipatterns)
 
 This document covers general Roslyn analyzer development practices for
 `DiagnosticAnalyzer`, `DiagnosticSuppressor`, and `CodeFixProvider` projects.
@@ -4457,3 +4458,93 @@ its documentation (see [Section 9](#9-diagnostic-design)) that explains:
 
 This reduces noise from indiscriminate suppressions and helps consumers
 understand the intent behind the rule.
+
+## 28. Typical misuses and antipatterns
+
+The patterns below are the failures that most often make an analyzer or code fix
+unreliable, slow, or impossible to load. They consolidate the warnings spread
+through this guide and the rules enforced by `Microsoft.CodeAnalysis.Analyzers`
+(RS1xxx / RS2xxx — see [Section 20](#20-validating-analyzer-quality-with-microsoftcodeanalysisanalyzers)).
+
+### State and execution model
+
+- **Storing per-compilation state in instance or static fields.** The analyzer
+  type is instantiated once and reused across compilations and target
+  frameworks, and callbacks may run concurrently. Build per-compilation state in
+  `RegisterCompilationStartAction` and capture it in nested callback closures.
+  This is exactly what `RS1008` guards against.
+- **Forgetting `EnableConcurrentExecution()` or
+  `ConfigureGeneratedCodeAnalysis(...)`.** Both belong in every `Initialize`
+  implementation (`RS1026` / `RS1025`). Omitting them hurts throughput and
+  leaves generated-code behavior undefined.
+- **Doing analysis work directly in `Initialize`.** `Initialize` must only
+  *register* callbacks; the real work happens in the registered actions.
+- **Registering a `CompilationStartAction` that registers no follow-up
+  action** (`RS1012`). It signals dead or mis-wired registration.
+
+### Semantics and correctness
+
+- **Comparing symbols with reference equality (`==`) instead of
+  `SymbolEqualityComparer`** (`RS1024`). Symbols obtained from different
+  positions can represent the same entity yet not be reference-equal.
+- **Ignoring the dual meaning of a `null` from `GetTypeByMetadataName`.** It
+  returns `null` both when the type is not found *and* when it is ambiguous;
+  use `GetTypesByMetadataName` when ambiguity is possible, and always guard.
+- **Calling `Compilation.GetSemanticModel()` inside a callback** (`RS1030`).
+  Prefer the semantic data already supplied by operation/symbol contexts.
+- **Using syntax matching where `IOperation` or symbol analysis is more
+  robust.** Syntax shape varies (casts, parentheses, expression-bodied
+  members); the operation layer normalizes it.
+- **Reporting a diagnostic whose ID is not in `SupportedDiagnostics`**
+  (`RS1005`). The host reads that property before `Initialize` to decide whether
+  to run the analyzer at all.
+
+### Performance
+
+- **Reading `AdditionalFiles` or resolving well-known types inside per-node
+  callbacks.** Parse and resolve once per compilation in
+  `CompilationStartAction`; capture the immutable result.
+- **Doing expensive semantic work in a hot syntax callback without an early
+  syntactic guard.** Filter cheaply by syntax first, then bind only the small
+  set of candidates.
+- **Ignoring cancellation.** Pass the context `CancellationToken` to every
+  API that accepts one and call `ThrowIfCancellationRequested()` in long loops;
+  never swallow `OperationCanceledException`.
+
+### Diagnostics, reliability, and code fixes
+
+- **Throwing from a callback.** Roslyn catches the exception (surfaced as
+  `AD0001`) but discards the analyzer's diagnostics for that compilation. Guard
+  every path and default safely on malformed configuration.
+- **Reporting on a broad declaration when a precise token/argument location
+  exists.** Imprecise locations make diagnostics and fades confusing.
+- **Setting `EquivalenceKey = Title` and then localizing the title.** This
+  silently breaks Fix All in non-English locales; use a culture-independent
+  `EquivalenceKey` and a localizable `Title`.
+- **Relying on `WellKnownFixAllProviders.BatchFixer` for shared-file edits.**
+  Concurrent edits to the same `AdditionalDocument` corrupt or lose entries;
+  implement a custom `FixAllProvider` that aggregates and applies one update.
+- **An over-broad `DiagnosticSuppressor`.** A wrong suppression hides a real
+  bug with no replacement diagnostic; keep conditions narrow and test both the
+  suppression and non-suppression cases.
+
+### Packaging and host compatibility
+
+- **Mixing `DiagnosticAnalyzer` and `Workspaces`-dependent code in one
+  assembly** (`RS1038`). Keep analyzers/suppressors in a compiler-clean
+  assembly and code fixes in a separate Workspaces assembly.
+- **Targeting anything other than `netstandard2.0`** for the analyzer assembly
+  (`RS1041`) without a deliberate, documented reason.
+- **Compiling against a newer Roslyn than the supported hosts.** The referenced
+  `Microsoft.CodeAnalysis` version is your minimum host version; mismatches
+  surface as `CS9057`/`CS8032`. Pin to the lowest minor that exposes the APIs
+  you use.
+- **Placing the same assembly in both `analyzers/dotnet/cs` and
+  `analyzers/dotnet/`** (or both versioned and unversioned `roslyn{version}`
+  folders) — it double-loads and produces duplicate diagnostics.
+- **Letting Roslyn authoring packages flow transitively.** Use
+  `PrivateAssets="all"` on every Roslyn `PackageReference`, and ship the
+  analyzer as an analyzer asset, not under `lib/`.
+- **Skipping release tracking for a shipping package** (`RS2008`). Keep
+  `AnalyzerReleases.Unshipped.md` in sync during development and move entries to
+  `AnalyzerReleases.Shipped.md` at release time.
