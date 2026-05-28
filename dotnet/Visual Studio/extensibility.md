@@ -55,9 +55,10 @@ Primary official sources used for this guide:
 - [20. Versioning and compatibility](#20-versioning-and-compatibility)
 - [21. Migration and hybrid architecture](#21-migration-and-hybrid-architecture)
 - [22. Future direction and acknowledged pain points](#22-future-direction-and-acknowledged-pain-points)
-- [23. Troubleshooting](#23-troubleshooting)
-- [24. Pre-publish checklist](#24-pre-publish-checklist)
-- [25. Key takeaways](#25-key-takeaways)
+- [23. Typical misuses and antipatterns](#23-typical-misuses-and-antipatterns)
+- [24. Troubleshooting](#24-troubleshooting)
+- [25. Pre-publish checklist](#25-pre-publish-checklist)
+- [26. Key takeaways](#26-key-takeaways)
 
 ## Quick start checklist
 
@@ -1347,7 +1348,107 @@ Expect the ecosystem to evolve like this:
 
 Design extensions so they can move with that evolution: keep core logic host independent, keep Visual Studio integration thin, avoid unnecessary VSSDK dependencies, and monitor breaking-change announcements.
 
-## 23. Troubleshooting
+## 23. Typical misuses and antipatterns
+
+The pitfalls below are the failures that most often make a Visual Studio
+extension unreliable, slow to load, or rejected from Marketplace. They
+consolidate warnings spread throughout this guide and are grounded in Microsoft
+Learn's model-selection, threading, Remote UI, and publishing checklist
+documentation.
+
+### Model selection and architecture
+
+- **Reaching for VSSDK by default.** For a new extension, start with
+  `VisualStudio.Extensibility` and only fall back to VSSDK/Community Toolkit for
+  an unsupported API or older Visual Studio support. Defaulting to in-process
+  hosting forfeits process isolation and modern .NET.
+- **Treating the Community Toolkit as a separate runtime model.** It still runs
+  in-process on VSSDK and inherits every UI-thread and reliability constraint;
+  the simpler surface can hide threading requirements that still apply.
+- **Putting business logic inside extension parts.** Keep parsers, license
+  logic, networking, and models in host-independent libraries so they can be
+  unit tested and reused across extension models. Command handlers and tool
+  windows should stay thin.
+
+### Threading and reliability
+
+- **Doing synchronous file or network I/O on the UI path.** This is the leading
+  cause of UI-delay notifications, which can prompt users to disable the
+  extension. Keep startup and command activation cheap.
+- **Blocking the UI thread on async work** (`.Result`, `.Wait()`,
+  `GetAwaiter().GetResult()`). Use `JoinableTaskFactory` and
+  `SwitchToMainThreadAsync` for UI-thread-only APIs; never block waiting for a
+  task.
+- **Calling `GetService` instead of `GetServiceAsync` in `InitializeAsync`.**
+  Synchronous service retrieval during package init risks deadlocks; prefer the
+  async service provider and switch to the main thread explicitly when required.
+- **Ignoring cancellation tokens.** Long operations and command handlers must
+  honor the supplied `CancellationToken`.
+- **Treating `IClientContext` as a live, mutable view of the IDE.** It is a
+  snapshot taken at invocation time and can be stale after an `await`; capture
+  the values you need synchronously.
+
+### Activation and packaging
+
+- **Eager package autoload to decide whether UI should appear.** Use
+  rule-based activation constraints (`VisibleWhen` / `EnabledWhen`) so Visual
+  Studio can hide or disable contributions without loading the extension
+  assembly.
+- **Hard-coding project type GUIDs instead of project capabilities** where a
+  capability check is available; capabilities are more robust across project
+  systems.
+- **Changing the VSIX ID, command names, or settings keys between releases.**
+  These are stable contract values; changing them breaks auto-update, settings
+  migration, enterprise allow-lists, and support scripts.
+- **Generating a `.pkgdef` for projects that register nothing** (support
+  libraries, analyzers, test projects), or shipping a stale/empty `.pkgdef` as a
+  workaround. Only VSSDK/hybrid package projects with registration attributes
+  should emit one.
+- **Forgetting `RegisterWithCodebase` for a VSIX-deployed VSSDK package.** When
+  the package DLL lives in the extension folder rather than
+  `PrivateAssemblies`/`PublicAssemblies`/GAC, the generated registration needs a
+  path-based `CodeBase` entry or Visual Studio cannot locate the package.
+
+### Remote UI
+
+- **Expecting arbitrary in-process WPF to work out-of-process.** Remote UI does
+  not support code-behind, event handlers, or your own custom controls; design
+  around MVVM with XAML, data binding, and async commands.
+- **Binding to types that are not Remote UI serializable.** Data context types
+  must be `[DataContract]` with `[DataMember]` members, and only Remote
+  UI-serializable types (primitives, `IAsyncCommand`, `XamlFragment`,
+  serializable collections, etc.) can be bound.
+- **Relying on `TwoWay` binding where races matter.** Capture values
+  synchronously at click time via command parameters rather than assuming a
+  shared object graph updates instantly across the process boundary.
+- **Ignoring themes.** Use Visual Studio theme resources so the UI works under
+  light, dark, and high-contrast themes.
+
+### Publishing, licensing, and privacy
+
+- **Blocking IDE startup with licensing UI or showing modal nags during typing,
+  build, or debug loops.** Surface license state in a command, tool window, or
+  options page, and fail closed only for premium features.
+- **Using open-ended Visual Studio version ranges** such as `[16.0,)`. Support
+  the current and previous version and validate every claimed version.
+- **Adding a new top-level menu next to File/Edit.** Publish guidance says to
+  feel native to Visual Studio; place commands in existing, contextually
+  appropriate menus.
+- **Shipping without a license, privacy notice (when any remote communication or
+  telemetry exists), high-quality 90x90 PNG icon, or accurate description.**
+  These are required by the publishing checklist and appear in Marketplace and
+  the installer.
+- **Sending source code, file paths, secrets, or repository URLs in telemetry**,
+  or phoning home on every command. Disclose, minimize, batch asynchronously,
+  and offer opt-out.
+
+### Testing
+
+- **Treating F5 deployment as sufficient.** Always install and test the actual
+  packaged `.vsix` from Release output and validate install, update, disable,
+  enable, and uninstall in a reset Experimental Instance.
+
+## 24. Troubleshooting
 
 ### Extension does not appear
 
@@ -1431,7 +1532,7 @@ Check:
 - the extension was uploaded and then made public;
 - users restarted Visual Studio when required for install/update.
 
-## 24. Pre-publish checklist
+## 25. Pre-publish checklist
 
 Before publishing or updating a Visual Studio extension:
 
@@ -1465,7 +1566,7 @@ Before publishing or updating a Visual Studio extension:
 28. Archive the exact VSIX that was published.
 29. Monitor Marketplace Q&A, ratings, crash reports, and support channels after release.
 
-## 25. Key takeaways
+## 26. Key takeaways
 
 - `VisualStudio.Extensibility` is the strategic model for new Visual Studio extensions.
 - VSSDK remains the compatibility and maximum-breadth model.
