@@ -372,6 +372,128 @@ Official references:
 - <https://learn.microsoft.com/visualstudio/extensibility/visualstudio.extensibility/get-started/create-your-first-extension>
 - <https://learn.microsoft.com/visualstudio/extensibility/vsix/publish/checklist#make-it-feel-native-to-vs>
 
+### VSSDK command definition with `.vsct` files
+
+In the new model, command metadata (display name, placement, icon, visibility,
+enabled state) lives in code as `CommandConfiguration`. In VSSDK and hybrid
+extensions, that same metadata is authored declaratively in an XML **command
+table** file, a `.vsct` file. A `.vsct` file describes the layout and appearance
+of command items for a VSPackage: buttons, combo boxes, menus, toolbars, and
+groups of command items. It is the VSSDK counterpart to the new model's
+metadata-driven contributions, and you still need it whenever you ship an
+in-process VSPackage that adds UI.
+
+Three building blocks underpin every command table:
+
+- **Commands** are the procedures the user can invoke (exposed as menu items,
+  buttons, list boxes, or other controls).
+- **Groups** are containers that hold commands and menus.
+- **Menus** are the containers shown in the UI (menus, submenus, toolbars, or
+  tool windows).
+
+The structural rules that the build enforces:
+
+- a command must live in a group; a group must live in a menu; a submenu must be
+  placed in a group, not directly in a menu;
+- only menus are actually displayed; groups and commands are not displayed on
+  their own;
+- every `Menu`, `Group`, and `Button` is identified by a `GUID:ID` pair, and
+  each pair must be unique;
+- an item can appear in more than one location by reusing it through a
+  `CommandPlacement` rather than by giving it multiple parents.
+
+The root element is `CommandTable`, which contains a `Commands` element (whose
+`Package` attribute names the owning package) and a `Symbols` element. The most
+common child elements are:
+
+| Element | Purpose |
+|---|---|
+| `Menus` | Defines menus, submenus, context menus, and toolbars |
+| `Groups` | Defines command groups (containers) |
+| `Buttons` | Defines command buttons / menu items and binds them to handlers |
+| `Bitmaps` | Declares icon images used by buttons |
+| `CommandPlacements` | Places an existing command/group/menu in additional locations |
+| `VisibilityConstraints` | Shows a command/menu only in a specified UI context |
+| `KeyBindings` | Assigns keyboard shortcuts to commands |
+| `UsedCommands` | Declares that this package implements a command defined elsewhere |
+| `Extern` / `Include` | References Visual Studio header files (for example `stdidcmd.h`, `vsshlids.h`) so you can parent your UI under IDE-defined menus and groups |
+| `Symbols` | Maps friendly names to the GUIDs and IDs used throughout the file |
+
+The `Symbols` section typically declares three `GuidSymbol` elements: one for the
+package GUID, one for the command set (all menus, groups, and commands), and one
+for the image/bitmap store. Each `GuidSymbol` contains `IDSymbol` elements that
+name the individual menus, groups, commands, and icons; no two `IDSymbol` values
+under the same `GuidSymbol` may collide. Visual Studio templates generate the
+package and command-set GUIDs automatically.
+
+Minimal shape:
+
+```xml
+<CommandTable xmlns="http://schemas.microsoft.com/VisualStudio/2005-10-18/CommandTable"
+              xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <Extern href="stdidcmd.h" />
+  <Extern href="vsshlids.h" />
+
+  <Commands Package="guidMyPackage">
+    <Groups>
+      <Group guid="guidMyCommandSet" id="MyMenuGroup" priority="0x0600">
+        <Parent guid="guidSHLMainMenu" id="IDM_VS_MENU_TOOLS" />
+      </Group>
+    </Groups>
+
+    <Buttons>
+      <Button guid="guidMyCommandSet" id="MyCommandId" priority="0x0100" type="Button">
+        <Parent guid="guidMyCommandSet" id="MyMenuGroup" />
+        <Icon guid="guidImages" id="bmpPic1" />
+        <Strings>
+          <ButtonText>My Command</ButtonText>
+        </Strings>
+      </Button>
+    </Buttons>
+  </Commands>
+
+  <Symbols>
+    <GuidSymbol name="guidMyPackage" value="{...}" />
+    <GuidSymbol name="guidMyCommandSet" value="{...}">
+      <IDSymbol name="MyMenuGroup" value="0x1020" />
+      <IDSymbol name="MyCommandId" value="0x0100" />
+    </GuidSymbol>
+    <GuidSymbol name="guidImages" value="{...}">
+      <IDSymbol name="bmpPic1" value="1" />
+    </GuidSymbol>
+  </Symbols>
+</CommandTable>
+```
+
+Guidelines for `.vsct` authoring:
+
+- keep the package, command-set, and image-store GUIDs stable; the `GUID:ID`
+  pair is the identity Visual Studio and your `OleMenuCommandService`/
+  `IOleCommandTarget` code uses to route a command;
+- parent your groups under IDE-defined menus/groups via `Extern` references
+  rather than inventing new top-level menus, consistent with the publish
+  checklist guidance to feel native to Visual Studio;
+- prefer `VisibilityConstraints` (UI context rules) over loading the package
+  just to hide a command, the VSSDK equivalent of the new model's activation
+  constraints;
+- match each `Button` ID to the command ID your package wires up in code so the
+  handler is invoked;
+- the `.vsct` is compiled by the VSSDK build tools into the package's
+  command-table resource; the resulting registration is referenced by the
+  package's generated `.pkgdef` (see Section 11).
+
+Pure out-of-process `VisualStudio.Extensibility` extensions do not use `.vsct`
+files; their command metadata is generated from `CommandConfiguration`. Use a
+`.vsct` only for the in-process VSPackage portion of a VSSDK or hybrid extension.
+
+Official references:
+
+- Design XML command table (`.vsct`) files: <https://learn.microsoft.com/visualstudio/extensibility/internals/designing-xml-command-table-dot-vsct-files>
+- How VSPackages add user interface elements: <https://learn.microsoft.com/visualstudio/extensibility/internals/how-vspackages-add-user-interface-elements>
+- Author `.vsct` files: <https://learn.microsoft.com/visualstudio/extensibility/internals/authoring-dot-vsct-files>
+- VSCT XML schema reference: <https://learn.microsoft.com/visualstudio/extensibility/vsct-xml-schema-reference>
+- IDE-defined commands, menus, and groups: <https://learn.microsoft.com/visualstudio/extensibility/internals/ide-defined-commands-menus-and-groups>
+
 ## 7. Activation constraints
 
 Activation constraints define when an extension loads, when a command is visible, and when a command is enabled. They are essential for performance and for a native user experience.
@@ -781,6 +903,132 @@ Out-of-process extensions avoid many VSSDK main-thread problems, but they introd
 
 Design APIs and services to batch operations when possible.
 
+### Reentrancy protection for long-running operations
+
+For operations that mutate solution or project state across multiple async steps
+(rename flows, file moves, refactoring orchestration, bulk project updates), use an
+explicit reentrancy guard pattern:
+
+1. Enter a dedicated operation scope before the first mutation.
+2. Activate a UI context or equivalent state flag used by command visibility/enabled
+   logic.
+3. Block known-disruptive commands during the critical window (for example build,
+   close solution, conflicting rename commands, or project add/remove operations).
+4. Surface a short user-facing message when an operation is blocked so users know
+   the behavior is temporary.
+5. Always clear the guard in a `finally` block so commands re-enable after success,
+   cancellation, or failure.
+
+Implementation notes:
+
+- Keep the blocked-command set narrow and scenario-specific.
+- Fail open if the guard infrastructure is unavailable, but log the condition.
+- Prefer command interception/`QueryStatus` guards over ad-hoc boolean checks spread
+  across handlers.
+- Treat this as reliability protection, not as a licensing or policy gate.
+
+### UI feedback for long-running operations
+
+When an operation can run longer than a brief UI interaction, make progress and
+state explicit so users do not retry commands, assume Visual Studio is hung, or
+interrupt the workflow at unsafe points.
+
+Recommended feedback pattern:
+
+1. **Start signal**
+   - Immediately show that work started (status bar text, tool-window banner, or
+     output pane message).
+   - Include operation scope in plain language (for example, "Renaming project and
+     related files...").
+2. **Progress updates**
+   - Prefer coarse-grained milestone updates over high-frequency UI churn.
+   - For indeterminate work, show phase-based progress (scan, validate, apply,
+     finalize) instead of fake percentages.
+   - For determinate work, report completed/total units when available.
+3. **Blocked-action feedback**
+   - If commands are temporarily disabled by a reentrancy guard, provide a concise
+     explanation and expected next step ("Operation in progress; try again when it
+     completes.").
+   - Avoid repeated modal dialogs; use non-modal surfaces where possible.
+4. **Cancellation feedback**
+   - If cancellation is supported, expose it from the same UI surface where progress
+     is shown.
+   - Acknowledge cancellation quickly and report rollback/partial-completion state
+     clearly.
+5. **Completion feedback**
+   - End with a clear success/failure/canceled summary.
+   - On failure, include actionable next steps and where to find diagnostics
+     (`ActivityLog.xml`, `%TEMP%\VSLogs`, extension output pane).
+
+#### API mapping: `VisualStudio.Extensibility` (out-of-process)
+
+- **Task Status Center progress (preferred for long background work)**
+  - Start: `ShellExtensibility.StartProgressReportingAsync(...)`
+  - Update: `ProgressReporter.Report(new ProgressStatus(percent, description))`
+  - End: dispose `ProgressReporter`.
+  - Use this for operations that can outlive a single command callback and should
+    be visible in Visual Studio's task/progress UX.
+- **Output details stream**
+  - Create channel once: `VisualStudioExtensibility.Views().Output.CreateOutputChannelAsync(...)`
+  - Write updates: `OutputChannel.WriteLineAsync(...)` or `OutputChannel.Writer.WriteLineAsync(...)`.
+  - Use this for milestone/detail logs users might review after completion.
+- **User prompts for explicit decisions**
+  - `ShellExtensibility.ShowPromptAsync(...)`.
+  - Use sparingly for blocking confirmations (cancel/continue/retry), not as a
+    primary progress channel.
+
+Notes:
+
+- `VisualStudio.Extensibility` Output window APIs are currently documented as
+  preview and may change; keep usage isolated behind a small adapter.
+- Prefer one progress reporter per logical operation to avoid noisy concurrent
+  progress signals.
+
+#### API mapping: VSSDK / in-process extensions
+
+- **Status bar (lightweight, non-blocking)**
+  - `IVsStatusbar.SetText(...)` for status text.
+  - `IVsStatusbar.Progress(...)` for determinate progress (known total).
+  - `IVsStatusbar.Animation(...)` for indeterminate progress.
+- **Threaded Wait Dialog (long-running, optionally cancelable)**
+  - Obtain `IVsThreadedWaitDialogFactory` (`SVsThreadedWaitDialogFactory`).
+  - Use `ThreadedWaitDialogHelper.StartWaitDialog(...)` or
+    `IVsThreadedWaitDialog2/3/4` start/update APIs.
+  - Best when work may take several seconds and needs explicit cancel/progress UI.
+- **Task Status Center (persistent background task tracking)**
+  - Use `IVsTaskStatusCenterService` for operations that should appear in the
+    standard Visual Studio background task experience.
+
+Selection guidance:
+
+- Use **status bar/progress reporter** for normal long-running operations.
+- Add **Output window** for diagnostic detail and post-run review.
+- Escalate to **Threaded Wait Dialog** only when cancel/progress needs a dedicated
+  dialog surface.
+- Use **Task Status Center** for operations that can continue in background and
+  should remain discoverable.
+
+UX and reliability rules:
+
+- Do not block startup or editor hot paths with progress UI.
+- Do not spam notifications for sub-second operations.
+- Keep messages idempotent and correlation-friendly (operation ID/target name).
+- Keep wording consistent across status text, prompts, and logs.
+
+This pattern aligns with Microsoft guidance to avoid UI-thread blocking and to keep
+activation/context rules explicit and testable:
+
+- Manage multiple threads in managed code: <https://learn.microsoft.com/visualstudio/extensibility/managing-multiple-threads-in-managed-code>
+- Use AsyncPackage to load VSPackages in the background: <https://learn.microsoft.com/visualstudio/extensibility/how-to-use-asyncpackage-to-load-vspackages-in-the-background>
+- Rule-based activation constraints: <https://learn.microsoft.com/visualstudio/extensibility/visualstudio.extensibility/inside-the-sdk/activation-constraints>
+- Start background progress reporting (`ShellExtensibility.StartProgressReportingAsync`): <https://learn.microsoft.com/dotnet/api/microsoft.visualstudio.extensibility.shell.shellextensibility.startprogressreportingasync>
+- Write to the Visual Studio output window (`CreateOutputChannelAsync`, `OutputChannel`): <https://learn.microsoft.com/visualstudio/extensibility/visualstudio.extensibility/output-window/output-window>
+- `ProgressStatus` and `ProgressReporter.Report`: <https://learn.microsoft.com/dotnet/api/microsoft.visualstudio.rpccontracts.progressreporting.progressstatus>
+- VSSDK status bar (`IVsStatusbar.SetText`, `Progress`, `Animation`): <https://learn.microsoft.com/dotnet/api/microsoft.visualstudio.shell.interop.ivsstatusbar>
+- VSSDK threaded wait dialog (`IVsThreadedWaitDialogFactory`): <https://learn.microsoft.com/dotnet/api/microsoft.visualstudio.shell.interop.ivsthreadedwaitdialogfactory>
+- VSSDK task status center (`IVsTaskStatusCenterService`): <https://learn.microsoft.com/dotnet/api/microsoft.visualstudio.taskstatuscenter.ivstaskstatuscenterservice>
+- Visual Studio UX guidance for notifications/progress: <https://learn.microsoft.com/visualstudio/extensibility/ux-guidelines/notifications-and-progress-for-visual-studio>
+
 ### In-process model
 
 In-process code must be extremely careful with the UI thread. Microsoft Learn warns that Visual Studio threading is hard and that incorrect use has been a constant source of bugs even for internal Visual Studio engineers. The official guidance points to `JoinableTaskFactory` for avoiding deadlocks. See: <https://learn.microsoft.com/visualstudio/extensibility/visualstudio.extensibility/extensibility-models#ui-thread-versus-background-thread>.
@@ -927,6 +1175,70 @@ Official reference: <https://learn.microsoft.com/visualstudio/extensibility/visu
 ### Activity log
 
 For in-process and host-level issues, start Visual Studio with `/log` and inspect `ActivityLog.xml` under the Visual Studio instance's application data folder. This is especially useful for package load failures, MEF composition failures, VSIX installation issues, and UI delay IDs.
+
+### Diagnosing issues reported after publishing
+
+Development-time debugging assumes you can press F5 and attach a debugger. Once
+the extension is on the Marketplace (or in a private gallery), failures are
+reported by users on machines, Visual Studio editions, and version bands you do
+not control. Diagnose them from evidence the user can collect, not from a local
+repro you may not be able to reproduce.
+
+Ask the reporting user for:
+
+- the exact extension version installed (Manage Extensions shows it);
+- the Visual Studio version, edition, and channel (Help > About);
+- whether the problem is at startup, on a specific command, or during a
+  long-running operation;
+- whether it reproduces in a reset Experimental Instance or only in their main
+  instance (a strong signal of a conflicting extension or corrupted MEF cache);
+- the relevant log artifacts described below.
+
+Production log artifacts to request:
+
+- **`ActivityLog.xml`** — have the user relaunch with `devenv /log` and
+  reproduce. This captures package load failures, MEF composition failures, and
+  VSIX install issues on their machine.
+- **`%TEMP%\VSLogs\*.svclog`** — the `TraceSource` output your out-of-process
+  extension wrote. This is why you should log meaningful diagnostics through the
+  injected `TraceSource` rather than `Console`/`Debug`: it is the one channel you
+  can ask a remote user to retrieve.
+- **UI-delay / hang report** — when Visual Studio attributes a UI delay or crash
+  to your extension, it surfaces a notification and records an ID. Ask for the
+  ID and, for deeper analysis, an ETW trace as described in the official UI-delay
+  diagnostics guide.
+
+Map common post-publication symptoms to causes:
+
+| Symptom reported by a user | Likely cause | First check |
+|---|---|---|
+| Extension does not appear after install | Visual Studio version/edition outside the manifest's supported range, or missing required workload | `.vsixmanifest` install targets vs. their VS version/edition |
+| Installs but command never shows | Activation constraint is false in their context, or (VSSDK) package failed to load | Diagnostics Explorer client context; `ActivityLog.xml` for load failure |
+| VSSDK package fails to load only when installed | Generated `.pkgdef` missing or cannot locate the deployed DLL | `RegisterWithCodebase`, `GeneratePkgDefFile`, `.pkgdef` present in VSIX (Section 11) |
+| Works for you, hangs for the user | Synchronous UI-thread work on a slower machine or larger solution | UI-delay ID; move work off the UI thread (Section 12) |
+| Update never reaches users | VSIX ID changed, version not increased, or listing not public | Stable VSIX ID and incremented version (Section 20) |
+| Tool window blank for some users | Theme/serialization issue surfacing only in their environment | `%TEMP%\VSLogs`; Remote UI serialization rules (Section 8) |
+
+Practices that make production reports diagnosable:
+
+- Log actionable diagnostics through the framework `TraceSource` (out-of-process)
+  or the activity log (in-process), including an operation name and a correlation
+  ID, so a user's `.svclog` is self-explanatory.
+- Surface a clear, copyable error message (and where to find logs) instead of
+  failing silently.
+- Keep the VSIX ID, command names, and settings keys stable so support scripts
+  and user reports remain valid across versions (Section 20).
+- Monitor the Marketplace Q&A, ratings, and any crash/telemetry feed after each
+  release; the publish workflow treats this as part of shipping (Section 25).
+- Reproduce in a clean VM or reset Experimental Instance with the user's reported
+  VS version before changing code; most post-publish reports are environment,
+  version-range, or conflicting-extension issues rather than logic bugs.
+
+Official references:
+
+- Diagnose UI delays caused by extensions: <https://learn.microsoft.com/visualstudio/extensibility/how-to-diagnose-ui-delays-caused-by-extensions>
+- Logging extension diagnostics: <https://learn.microsoft.com/visualstudio/extensibility/visualstudio.extensibility/inside-the-sdk/logging>
+- Find, install, and manage extensions (UI-delay/crash notifications): <https://learn.microsoft.com/visualstudio/ide/finding-and-using-visual-studio-extensions#manage-extensions>
 
 ## 16. Packaging and VSIX metadata
 
@@ -1384,6 +1696,11 @@ documentation.
   async service provider and switch to the main thread explicitly when required.
 - **Ignoring cancellation tokens.** Long operations and command handlers must
   honor the supplied `CancellationToken`.
+- **Running multi-step solution/project mutations without a reentrancy guard.**
+  If rename/move/update workflows can overlap with build, close-solution,
+  project-structure changes, or a second invocation of the same command, race
+  conditions and partial state are likely. Use an operation scope plus temporary
+  command blocking and guaranteed cleanup in `finally`.
 - **Treating `IClientContext` as a live, mutable view of the IDE.** It is a
   snapshot taken at invocation time and can be stale after an `await`; capture
   the values you need synchronously.
@@ -1520,6 +1837,21 @@ Check:
 - ETW trace as described in Microsoft docs.
 
 Official reference: <https://learn.microsoft.com/visualstudio/extensibility/how-to-diagnose-ui-delays-caused-by-extensions>.
+
+### Rename/move workflow intermittently fails or leaves partial state
+
+Check:
+
+- whether the workflow has a single-operation guard (scope flag/UI context) to
+  prevent reentrancy;
+- whether disruptive commands are temporarily blocked during the critical window;
+- whether cleanup/deactivation runs in a `finally` block on all exits;
+- whether blocked-command feedback is clear so users do not retry aggressively;
+- whether cancellation/timeout paths release the guard;
+- whether logs include operation start/finish/cancel/fail events for correlation.
+
+If failures correlate with overlapping rename/build/project-structure actions,
+prioritize reentrancy protection before tuning performance.
 
 ### Marketplace update does not reach users
 

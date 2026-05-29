@@ -501,6 +501,45 @@ var normalizedOptions = context.AnalyzerConfigOptionsProvider
     .WithComparer(GeneratorOptionsComparer.Instance);
 ```
 
+### Output registration methods
+
+Transforms (`Select`, `Where`, `SelectMany`, `Collect`, `Combine`, `WithComparer`)
+shape the pipeline; *output* registrations terminate it and decide what the host
+does with the result. The output method you choose maps to a value of
+`IncrementalGeneratorOutputKind`, and a host can selectively disable individual
+output kinds when creating a `GeneratorDriver`.
+
+| Method | Output kind | Adds to compilation? | Use for |
+|---|---|---|---|
+| `RegisterPostInitializationOutput` | `PostInit` | Yes — visible to later pipeline phases | Marker attributes and bootstrap code that do not depend on user source |
+| `RegisterSourceOutput` | `Source` | Yes | Normal generated source that affects the compilation and is visible in the IDE |
+| `RegisterImplementationSourceOutput` | `Implementation` | Yes, but implementation-only | Source that does not change the public/semantic surface, so IDE hosts may skip it during live analysis |
+| `RegisterHostOutput` | `Host` | No | Host-defined artifacts that never become C#; exposed via `GeneratorRunResult.HostOutputs` for a host to consume |
+
+`RegisterImplementationSourceOutput` exists so a host can avoid running
+implementation-only generation during interactive analysis when it only needs
+the declarations other code binds against. Use it only when the generated source
+genuinely does not affect what user code can *see* (no new public types, members,
+or signatures other code depends on); otherwise IntelliSense and navigation can
+diverge from the build. Both an `IncrementalValueProvider<T>` and an
+`IncrementalValuesProvider<T>` overload exist, and the callback receives the same
+`SourceProductionContext` as `RegisterSourceOutput`.
+
+`RegisterHostOutput` is a specialized, host-driven channel. Per the Roslyn API
+docs, a host output "has no defined use" in the compilation: outputs added via
+`HostOutputProductionContext.AddOutput(string name, object value)` do not
+contribute to the produced assembly and are surfaced only through
+`GeneratorRunResult.HostOutputs` for a host (for example a custom build tool or
+test harness) to interpret. A host may disable these outputs entirely. Do not
+use it as a substitute for emitting source; most generators never need it.
+
+Reference: `IncrementalGeneratorOutputKind`
+(<https://learn.microsoft.com/dotnet/api/microsoft.codeanalysis.incrementalgeneratoroutputkind>),
+`RegisterImplementationSourceOutput`
+(<https://learn.microsoft.com/dotnet/api/microsoft.codeanalysis.incrementalgeneratorinitializationcontext.registerimplementationsourceoutput>),
+and `RegisterHostOutput`
+(<https://learn.microsoft.com/dotnet/api/microsoft.codeanalysis.incrementalgeneratorinitializationcontext.registerhostoutput>).
+
 ## 6. Syntax discovery
 
 `SyntaxProvider` exists because syntax scanning can otherwise dominate IDE
@@ -530,6 +569,34 @@ var candidates = context.SyntaxProvider.ForAttributeWithMetadataName(
         return TypeModel.FromSymbol(type);
     });
 ```
+
+The transform receives a `GeneratorAttributeSyntaxContext`, which exposes the
+state you almost always need without an extra semantic-model lookup:
+
+| Member | Type | Meaning |
+|---|---|---|
+| `TargetNode` | `SyntaxNode` | The syntax node the attribute is attached to (for `[X] class C {}`, the class declaration) |
+| `TargetSymbol` | `ISymbol` | The symbol the attribute is attached to (for `[X] class C {}`, the `INamedTypeSymbol` for `C`) |
+| `Attributes` | `ImmutableArray<AttributeData>` | The matching attributes on `TargetSymbol`; always non-empty, and every `AttributeClass` matches the requested metadata name |
+| `SemanticModel` | `SemanticModel` | Semantic model for the file containing `TargetNode` |
+
+Notes that affect correctness:
+
+- `fullyQualifiedMetadataName` must include the `Attribute` suffix and be the
+  fully qualified *metadata* name, for example `"MyCompany.GenerateAttribute"`.
+- `Attributes` holds only the attributes that matched the requested name. To see
+  every attribute on the target, call `TargetSymbol.GetAttributes()`.
+- For partial types, only the parts that syntactically declare the attribute are
+  returned; if multiple parts declare it, each part is returned. Account for this
+  when building one model per logical type.
+- Read what you need from `Attributes`/`TargetSymbol` here and project it into an
+  equatable model immediately; do not let the `ISymbol`, `SemanticModel`, or
+  `SyntaxNode` flow further down the pipeline.
+
+Reference:
+<https://learn.microsoft.com/dotnet/api/microsoft.codeanalysis.syntaxvalueprovider.forattributewithmetadataname>
+and
+<https://learn.microsoft.com/dotnet/api/microsoft.codeanalysis.generatorattributesyntaxcontext>.
 
 ### Use `CreateSyntaxProvider` only when attributes are not viable
 
@@ -1508,6 +1575,36 @@ Andrew Lock part 2 covers snapshot testing; part 10 covers cacheability tests:
 - <https://andrewlock.net/creating-a-source-generator-part-2-testing-an-incremental-generator-with-snapshot-testing/>
 - <https://andrewlock.net/creating-a-source-generator-part-10-testing-your-incremental-generator-pipeline-outputs-are-cacheable/>
 
+### Validating the published package
+
+Driver tests prove the generator logic; they do not prove the *package* works in
+a real consumer build. Add at least one test that consumes the packed `.nupkg`
+the same way an end user would, because packaging mistakes (wrong analyzer
+folder, leaked Roslyn references, missing generation-time dependency) only appear
+once the generator loads as an analyzer asset.
+
+A practical package-validation flow:
+
+1. `dotnet pack` the generator into a local feed directory.
+2. Restore that package from a separate consumer test project that references it
+   as a normal `PackageReference` (not a project reference).
+3. Build the consumer project for every supported TFM and assert the build
+   succeeds and the expected generated members are present.
+4. Inspect the `.nupkg` (it is a ZIP) and assert the DLL is under
+   `analyzers/dotnet/cs` (or the intended `roslyn{version}` folder) and that no
+   Roslyn authoring package leaked into `lib/` or as a dependency.
+5. Run the consumer build under both `dotnet build` and, where feasible, a
+   Visual Studio live-analysis check, since the two hosts can use different
+   Roslyn versions.
+6. If you ship multiple Roslyn bands, repeat the consumer build against an SDK
+   from each band.
+
+Automate this as a CI job so packaging regressions fail the build before
+publishing rather than after a consumer reports them.
+
+Andrew Lock part 3 covers integration testing and packaging:
+<https://andrewlock.net/creating-a-source-generator-part-3-integration-testing-and-packaging/>.
+
 ## 15. Performance checklist
 
 Generator performance matters most in the IDE because pipelines may run after
@@ -1814,6 +1911,62 @@ Check:
 - Is the generated output target-framework-specific?
 - Does the generated code use APIs unavailable in the target TFM?
 - Are `UnsafeAccessor` declarations guarded for supported frameworks?
+
+### Diagnosing issues reported after publishing
+
+Development-time debugging (Section 18) assumes you can edit the generator and
+run a driver test. Once the generator ships as a NuGet package, failures are
+reported by consumers whose SDK, Visual Studio, Roslyn, and project shape you do
+not control. Treat the consumer's environment as the unit under test.
+
+First, collect a reproducible environment description from the reporter:
+
+- `dotnet --info` (CLI SDK and MSBuild versions);
+- Visual Studio version and its Roslyn/toolset band;
+- contents of `global.json`, if present;
+- the exact version of your generator package that is installed;
+- the target framework(s) of the failing project;
+- whether the failure is in `dotnet build`, in the IDE, or only in CI.
+
+Then capture compiler-level evidence rather than guessing:
+
+- **Binary log**: ask for `dotnet build /bl` and inspect `msbuild.binlog`. It
+  shows the resolved analyzer/generator assets, the `/analyzer:` (or
+  `/generator:`) switches actually passed to the compiler, and which Roslyn
+  targets ran. This is the single most useful production-diagnosis artifact.
+- **Analyzer report**: `dotnet build /p:ReportAnalyzer=true` confirms your
+  generator ran in the consumer's build and how long it took.
+- **Emitted output**: have the consumer set `EmitCompilerGeneratedFiles=true`
+  (see Section 18) and share the files under `obj/generated/`. This shows what
+  the generator actually produced in their environment, including per-TFM
+  differences.
+
+Map the common production symptoms to causes:
+
+| Symptom reported by a consumer | Likely cause | First check |
+|---|---|---|
+| `CS9057` | Generator was compiled against a newer Roslyn than the consumer's compiler | Your package's `Microsoft.CodeAnalysis.CSharp` floor vs. their SDK/VS band (Section 3 table) |
+| `CS8032` | Generator/analyzer instance could not be created (version mismatch, missing dependency, bad image, activation exception) | Binary log analyzer assets; missing generation-time dependency packed beside the DLL |
+| `CS8785` | The generator threw at run time for their specific input | Reproduce their source in a driver test; wrap risky transforms and report a diagnostic instead of throwing |
+| Works in CLI, fails in IDE (or vice versa) | Different Roslyn version between hosts; stale IDE generator cache | `global.json`, VS version; restart VS / clear component cache |
+| Builds but emits nothing | Marker attribute, predicate, or `AdditionalFiles` differ in their project | Their emitted-files folder; `CS8785` in their log |
+| Duplicate generated output / `CS0436` / `CS0101` | Package placed in both versioned and unversioned analyzer folders, or consumer committed generated files without `<Compile Remove>` | `.nupkg` layout; their project file |
+
+Production-readiness practices that make these reports diagnosable:
+
+- Never throw from the pipeline to signal a user error; report a diagnostic with
+  a stable ID so consumers can search for it and you can triage from the ID
+  alone.
+- Stamp generated code with `[GeneratedCode("MyGenerator", version)]` using a
+  deterministic version so a reported snippet reveals which package version
+  produced it.
+- Keep a regression test that pins each supported Roslyn band, so a consumer's
+  `CS9057`/`CS8032` report maps to a band you actually build and test.
+- Maintain a public changelog keyed by package version and minimum Roslyn/SDK so
+  you can confirm whether a reporter is on a supported combination.
+- When you cannot reproduce, ask for a `dotnet build /bl` and the
+  `EmitCompilerGeneratedFiles` output before changing code; most production
+  reports are environment mismatches, not generator logic bugs.
 
 ## 20. Source map to Andrew Lock's series
 
