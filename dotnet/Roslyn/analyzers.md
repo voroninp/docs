@@ -180,6 +180,14 @@ Analyzers:
    and normally also `[Shared]`. Keep MEF exports in the code-fix or
    refactoring assembly, not in the compiler-only analyzer assembly.
 
+> **MEF version pitfall:** Roslyn uses **MEF 2** (`System.Composition`), not
+> MEF 1 (`System.ComponentModel.Composition`). `ExportCodeFixProviderAttribute`
+> derives from `System.Composition.ExportAttribute`, so the matching `[Shared]`
+> attribute must be `System.Composition.SharedAttribute`. Importing the MEF 1
+> `System.ComponentModel.Composition` namespace and using its `[Shared]`-like
+> lifetime attributes will not be recognized, and the provider may fail to load
+> or be instantiated per-request.
+
 ### Rules
 
 - Do NOT use static mutable state
@@ -649,6 +657,14 @@ public sealed class SampleAnalyzer : DiagnosticAnalyzer
 }
 ```
 
+> **Why `public`?** The repository default is `internal`, but a
+> `DiagnosticAnalyzer` (or `DiagnosticSuppressor`) type must be `public`. The
+> compiler host discovers analyzers by reflecting over the assembly for
+> non-abstract public types carrying `[DiagnosticAnalyzer(...)]`; an `internal`
+> type is not discovered and the rule silently never runs. The same applies to
+> `[ExportCodeFixProvider]` and `[ExportCodeRefactoringProvider]` types, which
+> MEF must be able to instantiate.
+
 ## 6. Roslyn API selection guidance
 
 Choose the narrowest API that matches your rule:
@@ -666,6 +682,60 @@ In many analyzers, combining operation + syntax is useful:
 - use `IOperation` for semantic truth
 - use `SyntaxNode` for source-shape details (for example, argument naming
   syntax)
+
+### Callback registration surface
+
+Every registration method ultimately hangs off `AnalysisContext` (in
+`Initialize`) or one of the nested *start* contexts. Knowing the full surface
+helps you pick the cheapest callback that still has the state you need:
+
+| Registration method | Available on | Reports diagnostics? | Typical use |
+|---|---|---|---|
+| `RegisterSyntaxNodeAction<TSyntaxKind>` | `AnalysisContext`, `CompilationStartAnalysisContext`, `CodeBlockStartAnalysisContext`, `SymbolStartAnalysisContext` | Yes | Source-shape checks filtered by `SyntaxKind` |
+| `RegisterOperationAction` | same as above | Yes | Semantic checks filtered by `OperationKind` |
+| `RegisterSymbolAction` | `AnalysisContext`, `CompilationStartAnalysisContext` | Yes | Declaration-surface checks filtered by `SymbolKind` |
+| `RegisterSyntaxTreeAction` / `RegisterSemanticModelAction` | `AnalysisContext`, `CompilationStartAnalysisContext` | Yes | Whole-tree / whole-file checks |
+| `RegisterCompilationStartAction` | `AnalysisContext` | No (registers nested actions) | Build per-compilation cached state |
+| `RegisterCompilationEndAction` | `AnalysisContext`, `CompilationStartAnalysisContext` | Yes | Aggregate results after all per-symbol work |
+| `RegisterSymbolStartAction` | `AnalysisContext`, `CompilationStartAnalysisContext` | No (registers nested actions) | Analyze a symbol **and its members** together |
+| `RegisterOperationBlockStartAction` | `AnalysisContext`, `CompilationStartAnalysisContext`, `SymbolStartAnalysisContext` | No (registers nested actions) | Per-method-body state shared across nested operation actions |
+| `RegisterOperationBlockAction` | same as above | Yes | Whole method-body / field-initializer checks |
+| `RegisterCodeBlockStartAction<TSyntaxKind>` / `RegisterCodeBlockAction` | `AnalysisContext`, `CompilationStartAnalysisContext` | Start: no / Block: yes | Syntax-oriented per-method-body analysis |
+
+Two *start* actions deserve special attention because they enable scoped
+per-symbol or per-block caching without leaking state into fields (the
+RS1008-safe pattern):
+
+- **`RegisterSymbolStartAction`** runs at the start of analysis of an
+  `ISymbol` and its members. The `SymbolStartAnalysisContext` cannot report
+  diagnostics directly, but it can register nested operation, syntax-node,
+  operation-block, and a `RegisterSymbolEndAction` callback. Use it when a rule
+  must accumulate facts across all members of a type (for example, "this field
+  is written somewhere in the type") and report once in the end action.
+- **`RegisterOperationBlockStartAction`** runs at the start of a method body or
+  a field/property initializer. The `OperationBlockStartAnalysisContext`
+  likewise cannot report diagnostics itself, but it can register nested
+  operation actions plus a `RegisterOperationBlockEndAction`. Use it to build
+  per-body state (such as "did this body ever call `Dispose`?") shared by the
+  nested callbacks.
+
+```csharp
+context.RegisterSymbolStartAction(static symbolStart =>
+{
+    var writtenFields = new ConcurrentDictionary<IFieldSymbol, bool>(SymbolEqualityComparer.Default);
+
+    symbolStart.RegisterOperationAction(
+        opCtx => RecordFieldWrite(opCtx, writtenFields),
+        OperationKind.SimpleAssignment);
+
+    symbolStart.RegisterSymbolEndAction(
+        endCtx => ReportUnusedFields(endCtx, writtenFields));
+}, SymbolKind.NamedType);
+```
+
+The per-symbol/per-block state lives in the *start* action closure, is scoped
+to that symbol or block, and is discarded afterward — exactly like
+`CompilationStartAction` state is scoped to one compilation.
 
 ### Common `OperationKind` values
 
@@ -970,6 +1040,13 @@ Use the hierarchy as a heuristic, not as an absolute rule. A narrowly filtered
 operation action can still be the right design when semantic correctness
 matters more than a purely syntax-based approximation.
 
+The *start* actions (`CompilationStartAction`, `SymbolStartAction`,
+`OperationBlockStartAction`, `CodeBlockStartAction`) are not themselves a cost
+tier — they do not report diagnostics. Their cost is whatever setup you perform
+plus the nested actions they register. See the
+[callback registration surface](#callback-registration-surface) for which
+context exposes which registration method.
+
 For measurement and profiling, the same Roslyn comment also points to the
 historical `StyleCopTester` tool from the StyleCop Analyzers repository and to
 profiling analyzers under Visual Studio. Treat those as supplementary inputs
@@ -1208,6 +1285,21 @@ or CI baselines.
 ## 10. CodeFixProvider
 
 Code fixes produce a **new `Solution`** — they never mutate source in place.
+
+A `CodeFixProvider` subclass must override two members:
+
+- `FixableDiagnosticIds` — an `ImmutableArray<string>` of the diagnostic IDs
+  this provider can fix. The host uses it to decide which diagnostics offer this
+  fix, so the IDs must exactly match the analyzer's `DiagnosticDescriptor.Id`
+  values (reference the analyzer's `DiagnosticId` constants rather than
+  re-typing string literals to avoid drift).
+- `RegisterCodeFixesAsync(CodeFixContext context)` — inspects
+  `context.Diagnostics`, computes candidate fixes, and registers each via
+  `context.RegisterCodeFix(...)`.
+
+Optionally override `GetFixAllProvider()` to opt into Fix All (see
+[Fix All in Document/Project/Solution](#fix-all-in-documentprojectsolution)); it
+returns `null` by default, which hides the Fix All UI.
 
 Key rules:
 
