@@ -540,6 +540,92 @@ Reference: `IncrementalGeneratorOutputKind`
 and `RegisterHostOutput`
 (<https://learn.microsoft.com/dotnet/api/microsoft.codeanalysis.incrementalgeneratorinitializationcontext.registerhostoutput>).
 
+### Putting the pipeline together
+
+Most production generators are easier to reason about when the pipeline has
+separate stages for discovery, option parsing, combination, validation, and
+emission. The goal is to keep each stage cacheable and to combine only small
+equatable values.
+
+This is the usual shape for an attribute-driven generator with project-wide
+options:
+
+```csharp
+public void Initialize(IncrementalGeneratorInitializationContext context)
+{
+    context.RegisterPostInitializationOutput(static postInitializationContext =>
+        postInitializationContext.AddSource(
+            "GenerateSerializerAttribute.g.cs",
+            SourceText.From(AttributeSource, Encoding.UTF8)));
+
+    var options = context.AnalyzerConfigOptionsProvider
+        .Select(static (provider, _) => GeneratorOptions.From(provider))
+        .WithComparer(GeneratorOptionsComparer.Instance);
+
+    var targets = context.SyntaxProvider
+        .ForAttributeWithMetadataName(
+            fullyQualifiedMetadataName: "MyGenerator.GenerateSerializerAttribute",
+            predicate: static (node, _) => node is TypeDeclarationSyntax,
+            transform: static (attributeContext, cancellationToken) =>
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var symbol = (INamedTypeSymbol)attributeContext.TargetSymbol;
+                return SerializerTarget.From(symbol, attributeContext.Attributes);
+            })
+        .Where(static target => target is not null)
+        .WithTrackingName("SerializerTargets");
+
+    var languageVersion = context.ParseOptionsProvider
+        .Select(static (options, _) =>
+            ((CSharpParseOptions)options).LanguageVersion);
+
+    var inputs = targets
+        .Combine(options)
+        .Combine(languageVersion)
+        .Select(static (pair, cancellationToken) =>
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var ((target, options), languageVersion) = pair;
+            return SerializerInput.Create(target!, options, languageVersion);
+        })
+        .WithTrackingName("SerializerInputs");
+
+    context.RegisterSourceOutput(
+        inputs,
+        static (productionContext, input) =>
+        {
+            foreach (var diagnostic in input.Diagnostics.AsImmutableArray())
+            {
+                productionContext.ReportDiagnostic(diagnostic.ToDiagnostic());
+            }
+
+            if (input.Model is not null)
+            {
+                productionContext.AddSource(
+                    input.Model.HintName,
+                    SourceText.From(SerializerEmitter.Emit(input.Model), Encoding.UTF8));
+            }
+        });
+}
+```
+
+The important details are the boundaries, not the exact type names:
+
+- Attribute discovery returns a small model, not a symbol.
+- Options are read once into a value type and compared with a stable comparer.
+- `ParseOptionsProvider` is reduced to the single language-version value needed
+  by the emitter.
+- `Combine` happens after inputs have already been reduced.
+- Validation produces equatable diagnostic information rather than throwing.
+- Tracking names are placed on stages that should be asserted in cacheability
+  tests (Section 14).
+
+Split the final source and diagnostic registrations if diagnostics and generated
+source change independently (Section 10). Keeping them together is acceptable
+only when a single validated model always owns both.
+
 ## 6. Syntax discovery
 
 `SyntaxProvider` exists because syntax scanning can otherwise dominate IDE
@@ -1044,6 +1130,97 @@ If the generator reports diagnostics:
 - never throw from the pipeline to signal user errors;
 - test diagnostic IDs, messages, and locations.
 
+### Carrying diagnostics through the pipeline without breaking caching
+
+A subtle but common bug: a transform that needs to *both* produce a model and
+report a problem often returns the `Diagnostic` (or the originating `Location`,
+`ISymbol`, or `SyntaxNode`) inside its pipeline value. That silently destroys
+incrementality. `Location` and `Diagnostic` do **not** implement value equality,
+and a `Location` pins the `SyntaxTree` it came from, so the cached value compares
+unequal on every keystroke and the whole downstream pipeline re-runs.
+
+The cache-safe pattern is to project diagnostics into a small **equatable**
+record *inside* the transform, exactly like model values (Section 8), and to
+reconstruct the real `Location`/`Diagnostic` only at the output stage.
+
+```csharp
+internal readonly record struct LocationInfo(
+    string FilePath,
+    TextSpan TextSpan,
+    LinePositionSpan LinePositionSpan)
+{
+    public Location ToLocation()
+        => Location.Create(FilePath, TextSpan, LinePositionSpan);
+
+    public static LocationInfo? CreateFrom(SyntaxNode node)
+        => CreateFrom(node.GetLocation());
+
+    public static LocationInfo? CreateFrom(Location location)
+        => location.SourceTree is null
+            ? null
+            : new LocationInfo(
+                location.SourceTree.FilePath,
+                location.SourceSpan,
+                location.GetLineSpan().Span);
+}
+
+internal readonly record struct DiagnosticInfo(
+    DiagnosticDescriptor Descriptor,
+    LocationInfo? Location)
+{
+    public Diagnostic ToDiagnostic()
+        => Diagnostic.Create(Descriptor, Location?.ToLocation());
+}
+```
+
+`DiagnosticDescriptor` is safe to keep because the same static readonly
+descriptor instance is reused, so reference equality is stable across runs.
+
+Have the transform return both the model and any `DiagnosticInfo` values, then
+split the two streams. Report diagnostics from one output registration and emit
+source from the other, so a changed *diagnostic* does not invalidate cached
+*source* and vice versa:
+
+```csharp
+// transform returns: (EquatableArray<DiagnosticInfo> Diagnostics, Model? Value)
+var results = context.SyntaxProvider
+    .ForAttributeWithMetadataName(
+        "MyGenerator.GenerateAttribute",
+        predicate: static (node, _) => node is TypeDeclarationSyntax,
+        transform: static (ctx, ct) => ModelBuilder.Build(ctx, ct));
+
+context.RegisterSourceOutput(
+    results.Select(static (r, _) => r.Diagnostics),
+    static (spc, diagnostics) =>
+    {
+        foreach (var diagnostic in diagnostics.AsImmutableArray())
+        {
+            spc.ReportDiagnostic(diagnostic.ToDiagnostic());
+        }
+    });
+
+context.RegisterSourceOutput(
+    results
+        .Select(static (r, _) => r.Value)
+        .Where(static value => value is not null),
+    static (spc, value) => spc.AddSource(/* ... */));
+```
+
+Rules:
+
+- Never store `Diagnostic`, `Location`, `ISymbol`, or `SyntaxNode` in a pipeline
+  value; store an equatable `DiagnosticInfo`/`LocationInfo` instead.
+- Reuse static readonly `DiagnosticDescriptor` instances so descriptor equality
+  stays reference-stable.
+- Keep the descriptor `DiagnosticDescriptor` collection sorted/deterministic and
+  wrap diagnostic collections in `EquatableArray<T>` (Section 8).
+- Split diagnostics and source into separate output registrations so the two
+  caches are independent.
+
+Andrew Lock part 9 walks through this exact pitfall and the `LocationInfo`
+pattern:
+<https://andrewlock.net/creating-a-source-generator-part-9-avoiding-performance-pitfalls-in-incremental-generators/>.
+
 ## 11. AdditionalFiles
 
 `AdditionalFiles` lets a generator consume non-C# files such as JSON, XML,
@@ -1223,12 +1400,70 @@ Safety rules:
 - Do not throw from option parsing.
 - Document accepted keys and precedence.
 
-The generated analyzer-config representation stores keys in lower case. The
-built-in `AnalyzerConfigOptions` implementations happen to perform
-case-insensitive lookup today, but the property name component is part of an
-undocumented surface and relying on case-insensitivity is fragile across hosts
-and testing doubles. **Always query keys in lower case**, e.g.
-`build_property.targetframework`, to stay portable.
+Build property names in analyzer-config keys are case-sensitive. Query them with
+the same casing used by the MSBuild property exposed through
+`CompilerVisibleProperty`, for example `build_property.TargetFramework`.
+
+Common MSBuild properties worth exposing:
+
+| Property | Analyzer config key | Typical use |
+|---|---|---|
+| `TargetFramework` | `build_property.TargetFramework` | TFM-specific output and feature guards |
+| `RootNamespace` | `build_property.RootNamespace` | Default generated namespace when user source has no namespace |
+| `MSBuildProjectDirectory` | `build_property.MSBuildProjectDirectory` | Stable relative paths for diagnostics, emitted hint names, and additional-file precedence |
+| `Nullable` | `build_property.Nullable` | Deciding whether generated declarations should include nullable annotations |
+| Custom package property such as `MyGenerator_Mode` | `build_property.MyGenerator_Mode` | Project-wide generator policy |
+
+Expose only the properties you need:
+
+```xml
+<Project>
+  <ItemGroup>
+    <CompilerVisibleProperty Include="TargetFramework" />
+    <CompilerVisibleProperty Include="RootNamespace" />
+    <CompilerVisibleProperty Include="MSBuildProjectDirectory" />
+    <CompilerVisibleProperty Include="Nullable" />
+    <CompilerVisibleProperty Include="MyGenerator_Mode" />
+  </ItemGroup>
+</Project>
+```
+
+Read them through correctly cased keys and normalize immediately:
+
+```csharp
+var buildOptions = context.AnalyzerConfigOptionsProvider
+    .Select(static (provider, _) =>
+    {
+        provider.GlobalOptions.TryGetValue(
+            "build_property.TargetFramework",
+            out var targetFramework);
+
+        provider.GlobalOptions.TryGetValue(
+            "build_property.RootNamespace",
+            out var rootNamespace);
+
+        provider.GlobalOptions.TryGetValue(
+            "build_property.MSBuildProjectDirectory",
+            out var projectDirectory);
+
+        provider.GlobalOptions.TryGetValue(
+            "build_property.Nullable",
+            out var nullable);
+
+        return new BuildOptions(
+            TargetFramework: targetFramework ?? string.Empty,
+            RootNamespace: NormalizeNamespace(rootNamespace),
+            ProjectDirectory: projectDirectory ?? string.Empty,
+            NullableEnabled: string.Equals(nullable, "enable", StringComparison.OrdinalIgnoreCase));
+    });
+```
+
+Do not read `Directory.GetCurrentDirectory()` or environment variables to infer
+project paths. Compiler hosts differ: Visual Studio, `dotnet build`, compiler
+server processes, and test drivers can all run with different working
+directories. If a path matters, expose the MSBuild property deliberately and
+store a normalized relative path in your model rather than an absolute path when
+possible.
 
 ### `.editorconfig` and `.globalconfig`
 
@@ -1458,6 +1693,42 @@ Most C# source generators belong under `analyzers/dotnet/cs`. Do not place the
 same assembly in both `analyzers/dotnet/` and `analyzers/dotnet/cs/`; a C#
 project can load both and produce duplicate output or diagnostics.
 
+The analyzer folder controls which project languages receive the assembly; the
+`[Generator]` attribute controls which languages the generator advertises to the
+Roslyn host. Keep both aligned:
+
+```csharp
+[Generator(LanguageNames.CSharp)]
+internal sealed class CSharpOnlyGenerator : IIncrementalGenerator
+{
+    public void Initialize(IncrementalGeneratorInitializationContext context)
+    {
+        // Emits C# source and uses C# syntax nodes.
+    }
+}
+```
+
+Language-specific rules:
+
+- A generator under `analyzers/dotnet/cs` should emit valid C# and normally use
+  `[Generator(LanguageNames.CSharp)]`.
+- A generator under `analyzers/dotnet/vb` must emit valid Visual Basic source
+  and use VB syntax/semantic assumptions. Do not share a C# emitter with VB
+  projects unless it has a separate VB output path.
+- Avoid `analyzers/dotnet/` for C#-only generators. The assembly may be offered
+  to non-C# projects, and generated C# source is invalid in those compilations.
+- If a package ships both C# and VB generators, prefer separate assemblies or
+  separate generator types with explicit language lists and separate test
+  projects for each language.
+- Source generators do not make one language consume generated source written in
+  another language. `AddSource` adds syntax trees to the current compilation's
+  language.
+
+Reference: `GeneratorAttribute`
+(<https://learn.microsoft.com/dotnet/api/microsoft.codeanalysis.generatorattribute>)
+and `LanguageNames`
+(<https://learn.microsoft.com/dotnet/api/microsoft.codeanalysis.languagenames>).
+
 Andrew Lock part 3 covers integration testing and NuGet packaging:
 <https://andrewlock.net/creating-a-source-generator-part-3-integration-testing-and-packaging/>.
 
@@ -1558,6 +1829,21 @@ var runDriver = driver.RunGenerators(compilation);
 var result = runDriver.GetRunResult();
 ```
 
+Some low-level driver APIs and older test helpers still accept
+`ISourceGenerator` rather than `IIncrementalGenerator`. Do not implement the old
+interface just for tests. Use Roslyn's adapter instead:
+
+```csharp
+ISourceGenerator generator = new MyGenerator().AsSourceGenerator();
+
+var driver = CSharpGeneratorDriver.Create(generator);
+```
+
+`AsSourceGenerator()` is only an adapter for host APIs; the generator itself
+should still implement `IIncrementalGenerator` and define all work in the
+incremental pipeline. Reference: `GeneratorExtensions.AsSourceGenerator`
+(<https://learn.microsoft.com/dotnet/api/microsoft.codeanalysis.generatorextensions.assourcegenerator>).
+
 Testing guidance:
 
 - Assert generated source file names.
@@ -1574,6 +1860,96 @@ Andrew Lock part 2 covers snapshot testing; part 10 covers cacheability tests:
 
 - <https://andrewlock.net/creating-a-source-generator-part-2-testing-an-incremental-generator-with-snapshot-testing/>
 - <https://andrewlock.net/creating-a-source-generator-part-10-testing-your-incremental-generator-pipeline-outputs-are-cacheable/>
+
+### Testing pipeline cacheability
+
+Snapshot tests prove the generator emits the right text; they do **not** prove
+the pipeline is incremental. A model that accidentally carries a `SyntaxNode`,
+`ISymbol`, or unwrapped `ImmutableArray<T>` still produces correct output — it
+just recomputes everything on every keystroke. Cacheability has to be asserted
+explicitly, and the mechanism is `WithTrackingName` plus the run-step `Reason`
+exposed on `GeneratorDriverRunResult`.
+
+Two ingredients are required:
+
+1. **Name the stages you care about** with `WithTrackingName` so the driver
+   records their per-run steps.
+
+   ```csharp
+   public const string ModelTrackingName = "Models";
+
+   var models = context.SyntaxProvider
+       .ForAttributeWithMetadataName(
+           "MyGenerator.GenerateAttribute",
+           predicate: static (node, _) => node is TypeDeclarationSyntax,
+           transform: static (ctx, ct) => ModelBuilder.Build(ctx, ct))
+       .WithTrackingName(ModelTrackingName);
+   ```
+
+2. **Enable step tracking on the driver** with
+   `GeneratorDriverOptions(IncrementalGeneratorOutputKind.None, trackIncrementalGeneratorSteps: true)`,
+   run the generator twice, and assert that the second run reports every tracked
+   step as `IncrementalStepRunReason.Cached` (or `Unchanged`).
+
+```csharp
+var driver = CSharpGeneratorDriver.Create(
+    generators: [new MyGenerator().AsSourceGenerator()],
+    driverOptions: new GeneratorDriverOptions(
+        disabledOutputs: IncrementalGeneratorOutputKind.None,
+        trackIncrementalGeneratorSteps: true));
+
+// First run populates the cache.
+driver = driver.RunGenerators(compilation);
+
+// Re-run against a *clone* of the same compilation. A clone has identical
+// content but different SyntaxTree instances, so it proves the generator caches
+// on value equality, not on reference identity.
+var clone = compilation.WithAssemblyName("Tests-clone");
+driver = driver.RunGenerators(clone);
+
+var steps = driver.GetRunResult()
+    .Results[0]
+    .TrackedSteps[MyGenerator.ModelTrackingName];
+
+foreach (var step in steps)
+{
+    foreach (var (_, reason) in step.Outputs)
+    {
+        Assert.True(
+            reason is IncrementalStepRunReason.Cached or IncrementalStepRunReason.Unchanged,
+            $"Step '{MyGenerator.ModelTrackingName}' was '{reason}', expected Cached/Unchanged.");
+    }
+}
+```
+
+Interpreting the `IncrementalStepRunReason` values:
+
+| Reason | Meaning | Expected in a "no real change" re-run |
+|---|---|---|
+| `New` | First time the step produced this output | Only on the first run |
+| `Cached` | Input was equal; cached output reused | Yes |
+| `Unchanged` | Step re-ran but produced an equal value | Yes |
+| `Modified` | Input changed; output recomputed and differs | A genuine bug if inputs were equal |
+| `Removed` | Input disappeared | Only when an input was removed |
+
+If a step you expect to be cached reports `Modified`, the model for that stage is
+not value-equatable — typically because it holds a `SyntaxNode`/`ISymbol`/
+`Location` or an `ImmutableArray<T>` without an `EquatableArray<T>` wrapper or
+`WithComparer` (Sections 8 and 10).
+
+Guidance:
+
+- Add a `public const string` tracking name per stage you assert on; reference
+  the same constant from the test to avoid drift.
+- Always re-run against a *cloned* compilation, never the identical instance, so
+  the test exercises value equality rather than reference equality.
+- Assert the **final** combined stage and the key intermediate stages; a cached
+  final stage with a `Modified` intermediate stage still wastes work.
+- Run cacheability assertions in CI; they catch the most expensive regressions,
+  which are invisible to snapshot tests.
+
+Andrew Lock part 10 is dedicated to this technique:
+<https://andrewlock.net/creating-a-source-generator-part-10-testing-your-incremental-generator-pipeline-outputs-are-cacheable/>.
 
 ### Validating the published package
 
