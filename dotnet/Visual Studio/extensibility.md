@@ -19,6 +19,9 @@ Primary official sources used for this guide:
 - Microsoft Learn, *VSIX extension schema 2.0 reference*: <https://learn.microsoft.com/visualstudio/extensibility/vsix-extension-schema-2-0-reference>
 - Microsoft Learn, *Prepare extensions for Windows Installer deployment*: <https://learn.microsoft.com/visualstudio/extensibility/preparing-extensions-for-windows-installer-deployment>
 - Microsoft Learn, *Make extensions compatible with Visual Studio 2019/2017 and Visual Studio 2015*: <https://learn.microsoft.com/visualstudio/extensibility/how-to-roundtrip-vsixs>
+- Microsoft Learn, *Supporting Multiple Versions of Visual Studio*: <https://learn.microsoft.com/visualstudio/extensibility/supporting-multiple-versions-of-visual-studio>
+- Microsoft Learn, *Update a Visual Studio extension*: <https://learn.microsoft.com/visualstudio/extensibility/how-to-update-a-visual-studio-extension>
+- Microsoft Learn, *Extension compatibility model for Visual Studio*: <https://learn.microsoft.com/visualstudio/extensibility/migration/extension-compatibility>
 - Microsoft Learn, *Use AsyncPackage to load VSPackages in the background*: <https://learn.microsoft.com/visualstudio/extensibility/how-to-use-asyncpackage-to-load-vspackages-in-the-background>
 - Microsoft Learn, *Manage multiple threads in managed code*: <https://learn.microsoft.com/visualstudio/extensibility/managing-multiple-threads-in-managed-code>
 - Microsoft Learn, *Registering VSPackages*: <https://learn.microsoft.com/visualstudio/extensibility/internals/registering-vspackages>
@@ -1903,6 +1906,67 @@ Example publish manifest shape:
 
 The documented `priceCategory` values are `free`, `trial`, and `paid`. See: <https://learn.microsoft.com/visualstudio/extensibility/walkthrough-publishing-a-visual-studio-extension-via-command-line#publishmanifest-file>.
 
+### Multi-version publishing strategy
+
+Multi-version publishing means maintaining compatible update flows for users on
+more than one Visual Studio generation without breaking auto-update identity.
+
+Core rules:
+
+- keep the same VSIX ID for updates that are part of the same upgrade line;
+- publish a strictly higher extension version for every update;
+- do not reuse version numbers;
+- test each published package against every Visual Studio version it claims.
+
+Marketplace and update behavior to design around:
+
+- Visual Studio installs an update when the incoming VSIX has the same extension
+  `ID` and a higher `Version`;
+- if ID differs, Visual Studio treats it as a separate extension;
+- Marketplace update metadata marks several fields as non-changeable on update,
+  including supported Visual Studio versions/editions, so treat those as stable
+  per listing.
+
+Practical publishing patterns:
+
+1. **Single listing, single package line**
+   - Use one extension ID and one version stream when one VSIX can support all
+     intended Visual Studio versions.
+   - Best fit when the same binaries and manifest constraints work across the
+     whole target matrix.
+2. **Separate listings for separate compatibility lines**
+   - Use separate extension IDs/listings when compatibility bands diverge (for
+     example legacy VSSDK package for older Visual Studio and a modern package
+     for newer Visual Studio).
+   - This avoids immutable-listing metadata collisions and keeps support
+     expectations explicit.
+3. **Ringed rollout per compatibility line**
+   - Publish private first, validate install/update on each target Visual Studio
+     band, then make public.
+
+Versioning policy for parallel lines:
+
+- keep independent version streams per listing (for example `2.x` legacy,
+  `3.x` modern) to simplify support and rollback;
+- document end-of-support dates for older Visual Studio lines;
+- when retiring a line, publish a final release note with migration guidance.
+
+Operational checklist for multi-version publishing:
+
+1. Lock extension identity values (VSIX ID, internal name, publisher).
+2. Decide whether one listing is sufficient or separate listings are required.
+3. Align manifest installation targets with the intended compatibility line.
+4. Build and package each line independently in CI.
+5. Run install/update/uninstall smoke tests per supported Visual Studio version.
+6. Publish with monotonic versions and archive the exact VSIX artifacts.
+7. Monitor post-release reports by Visual Studio version band.
+
+Official references:
+
+- Update behavior by VSIX ID and version: <https://learn.microsoft.com/visualstudio/extensibility/how-to-update-a-visual-studio-extension>
+- Marketplace update fields and publishing flow: <https://learn.microsoft.com/visualstudio/extensibility/walkthrough-publishing-a-visual-studio-extension#update-a-published-extension-in-visual-studio-marketplace>
+- Multi-version support background: <https://learn.microsoft.com/visualstudio/extensibility/supporting-multiple-versions-of-visual-studio>
+
 ### CI/CD automation for publishing
 
 Treat publishing as a gated release pipeline, not a single script step. A robust
@@ -2641,7 +2705,7 @@ Marketplace publisher roles include Creator, Reader, Contributor, and Owner. See
 
 ### Visual Studio version ranges
 
-Do not use broad open-ended ranges casually. Microsoft's publishing checklist recommends supporting only the previous and current Visual Studio version where possible and says not to specify open-ended ranges such as `[16.0,)`.
+Do not use broad open-ended ranges casually. Microsoft's publishing checklist recommends supporting only the previous and current Visual Studio version where possible and says not to specify open-ended ranges such as `[16.0,)` unless you have a deliberate compatibility and servicing policy.
 
 Official reference: <https://learn.microsoft.com/visualstudio/extensibility/vsix/publish/checklist#use-proper-version-ranges>.
 
@@ -2652,6 +2716,96 @@ Practical policy:
 - keep separate VSIXs if one version must use different APIs or runtime assumptions;
 - test every claimed Visual Studio version;
 - update version ranges only after validation.
+
+### Supporting multiple Visual Studio versions
+
+Supporting multiple Visual Studio versions is a compatibility contract, not just
+a manifest setting. Decide first whether one VSIX can safely serve all target
+versions, or whether separate VSIXs are clearer and safer.
+
+Use one VSIX when:
+
+- the same extension binaries can run on every target version;
+- all APIs used by the extension exist in the minimum supported Visual Studio
+  version;
+- prerequisites and workloads are the same across target versions;
+- UI, command placement, activation constraints, and packaging behavior have
+  been tested on every claimed version.
+
+Use separate VSIXs when:
+
+- the extension needs different target frameworks, SDK packages, or VSSDK
+  references per Visual Studio generation;
+- newer Visual Studio APIs are required for newer users, but older users still
+  need a maintained build;
+- `VisualStudio.Extensibility` is used for modern Visual Studio versions while a
+  VSSDK build is kept for older Visual Studio versions;
+- the extension has edition/workload-specific dependencies that would make one
+  manifest misleading.
+
+Practical version-range examples:
+
+```xml
+<!-- Visual Studio 2022 and Visual Studio 2026 under the VS 2026 compatibility model. -->
+<InstallationTarget
+  Id="Microsoft.VisualStudio.Community"
+  Version="[17.0,18.0)" />
+```
+
+```xml
+<!-- New Visual Studio 2026 templates can use a 17.0 lower bound with no upper bound. -->
+<InstallationTarget
+  Id="Microsoft.VisualStudio.Community"
+  Version="[17.0,)" />
+```
+
+```xml
+<!-- Legacy VSSDK-style range for a VSIX that intentionally supports VS 2015-2019. -->
+<InstallationTarget
+  Id="Microsoft.VisualStudio.Community"
+  Version="[14.0,17.0)" />
+```
+
+For Visual Studio 2026, Microsoft documents an API-version-based compatibility
+model for VSIX extensions. Visual Studio 2026 supports API version `17.x`, uses
+the lower bound of the installation target version range to evaluate
+compatibility, and ignores the upper bound. This means a VSIX that works in
+Visual Studio 2022 and targets supported stable APIs can usually load in Visual
+Studio 2026 without republishing. Existing extensions with a minimum version of
+`16.0` or lower should be updated to declare a `17.0` minimum if they are meant
+to participate in the modern compatibility model.
+
+For older Visual Studio support, the manifest range is only one part of the
+work. The project must also avoid references unavailable in the minimum Visual
+Studio version, use compatible VSSDK build tools, declare prerequisites with
+ranges broad enough for all intended versions, and test installation and runtime
+behavior in each target IDE. Microsoft Learn's round-tripping guidance for
+Visual Studio 2015 through 2019 specifically calls out updating install targets,
+prerequisites, `MinimumVisualStudioVersion`, `VsixType`, debug properties, and
+conditional imports for build tools.
+
+Checklist for a multi-version VSIX:
+
+1. Pick the minimum supported Visual Studio version based on the oldest API you
+   need, not on marketing reach.
+2. Reference the VSSDK package/build tools that match the lowest supported
+   Visual Studio version, then conditionally handle newer APIs only after
+   checking availability.
+3. Keep installation targets and prerequisites aligned; do not claim a Visual
+   Studio version if a required component did not exist there.
+4. Avoid preview APIs for production Marketplace builds unless the target channel
+   is explicitly preview/internal.
+5. Test install, update, command visibility, command execution, package load,
+   tool windows, settings migration, and uninstall in every supported Visual
+   Studio major version.
+6. For MSI-distributed extensions, handle version detection and installation
+   yourself; the VSIX compatibility model does not manage MSI compatibility.
+
+Official references:
+
+- Visual Studio 2026 extension compatibility model: <https://learn.microsoft.com/visualstudio/extensibility/migration/extension-compatibility>
+- Round-tripping VSIX projects across Visual Studio 2015/2017/2019: <https://learn.microsoft.com/visualstudio/extensibility/how-to-roundtrip-vsixs>
+- Publishing checklist version-range guidance: <https://learn.microsoft.com/visualstudio/extensibility/vsix/publish/checklist#use-proper-version-ranges>
 
 ### Extension versioning
 
