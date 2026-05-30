@@ -164,7 +164,7 @@ However, the Toolkit is still built on VSSDK. It does not remove the fundamental
 | Scenario | Recommendation |
 |---|---|
 | New extension for VS 2026 with supported command/editor/tool-window APIs | Use `VisualStudio.Extensibility` out-of-process. |
-| New extension with one unsupported legacy shell operation | Start with `VisualStudio.Extensibility`; isolate the legacy call in an in-process bridge if needed. |
+| New extension with one unsupported legacy shell operation | Start with `VisualStudio.Extensibility`; try a brokered service first, then isolate the legacy call in an in-process bridge only if needed. |
 | Existing VSIX that targets VS 2019 and VS 2022/2026 | Keep VSSDK for down-level support; split common business logic into shared libraries; consider a separate new-model VSIX for newer VS versions. |
 | Existing extension that only supports modern Visual Studio and uses APIs now covered by the new SDK | Rewrite or gradually migrate to `VisualStudio.Extensibility`. |
 | Extension is primarily a Roslyn analyzer/source generator | Package as NuGet analyzer assets, not as a VSIX, unless you also need IDE UI. |
@@ -229,6 +229,34 @@ Official references:
 - <https://learn.microsoft.com/visualstudio/extensibility/visualstudio.extensibility/visualstudio-extensibility#install-visualstudioextensibility>
 - <https://github.com/microsoft/VSExtensibility>
 
+### NuGet packages and SDK references
+
+The new model is delivered as a set of NuGet packages that provide the APIs, build tooling, code generation, and analyzers. Reference the meta-package and let it pull in the rest rather than referencing the individual packages directly.
+
+| Package | Role | Notes |
+|---|---|---|
+| `Microsoft.VisualStudio.Extensibility.Sdk` | Primary meta-package | Reference this from every new-model extension. It carries dependencies on the prerequisite packages below, so you normally do not reference them explicitly. |
+| `Microsoft.VisualStudio.Extensibility.Build` | Build tooling and project-capability code generators | Required for the build and for F5 debugging in the Visual Studio IDE. |
+| `Microsoft.VisualStudio.Extensibility` | SDK APIs and utility libraries | The out-of-process API surface; pulled in transitively by the SDK meta-package. |
+| `Microsoft.VisualStudio.Extensibility.JsonGenerators.Sdk` | Metadata code generators | Generates the contribution metadata emitted at build time. Without it a compiled extension may not work because the metadata files are missing. |
+| `Microsoft.VisualStudio.Sdk` | VSSDK meta-package | Add only for in-process/hybrid scenarios that must consume VSSDK or MEF services (see Section 10 and Section 21). |
+
+Reference both new-model packages with `PrivateAssets="all"` so they do not flow to consumers of the project:
+
+```xml
+<ItemGroup>
+  <PackageReference Include="Microsoft.VisualStudio.Extensibility.Sdk" Version="17.*" PrivateAssets="all" />
+  <PackageReference Include="Microsoft.VisualStudio.Extensibility.Build" Version="17.*" PrivateAssets="all" />
+</ItemGroup>
+```
+
+Microsoft may ship optional feature-area packages (for example debugger or source-control APIs) that are not pulled in by the meta-package; add those only when you use the corresponding feature.
+
+Official references:
+
+- <https://learn.microsoft.com/visualstudio/extensibility/visualstudio.extensibility/inside-the-sdk/inside-the-sdk#nuget-packages>
+- <https://www.nuget.org/packages/Microsoft.VisualStudio.Extensibility.Sdk/>
+
 ### Recommended repository layout
 
 For a medium-to-large extension, prefer a split like this:
@@ -288,6 +316,25 @@ The `ExtensionConfiguration.Metadata` value is used to generate VSIX metadata. K
 - description.
 
 Changing the VSIX ID breaks update identity. Marketplace publishing docs state that the VSIX ID is the unique identifier Visual Studio uses for the extension and is required for auto-update behavior. See: <https://learn.microsoft.com/visualstudio/extensibility/walkthrough-publishing-a-visual-studio-extension#publish-the-extension-to-visual-studio-marketplace>.
+
+### Localization implementation notes
+
+Localization quality is an operational concern, not just translation coverage.
+For extension UI strings (commands, prompts, settings, progress messages,
+diagnostics shown to users):
+
+- centralize user-visible strings in resource files and reference keys from
+  metadata (`%...%`) where supported;
+- use stable, descriptive resource keys (`Command.OpenDocumentation.DisplayName`)
+  so keys survive refactoring;
+- include both short labels and longer descriptions where the API supports both
+  (for example setting `DisplayName` + `Description`);
+- avoid concatenating sentence fragments in code, which harms translation
+  quality and grammar in many languages;
+- localize error/help links and docs entry points when region-specific content
+  exists, otherwise keep one canonical URL;
+- add a localization smoke test pass (switch VS UI language, verify command
+  labels, settings descriptions, and help links).
 
 ## 5. Extension anatomy
 
@@ -366,6 +413,32 @@ Guidelines:
 - prefer activation constraints over checking context late;
 - localize display names through string resources;
 - avoid adding top-level menus; Microsoft publish guidance says not to add a new menu next to File/Edit/etc.
+
+### Command placement and discoverability checklist
+
+When adding commands, treat placement as a UX decision, not just a technical one.
+A practical placement rubric:
+
+- put commands in the **closest user workflow context** first (editor context
+  menu for editor actions, project/solution context menu for project actions);
+- add an **Extensions menu** fallback only if discoverability would otherwise be
+  poor;
+- reserve toolbars for high-frequency actions that users repeatedly invoke in a
+  session;
+- avoid duplicating the same command in many places unless each placement serves
+  a different entry flow;
+- use command text that starts with a clear verb and scope (for example,
+  `Generate API Client` vs `Run`);
+- if a command is only valid in specific contexts, hide/disable it via
+  activation constraints (new model) or visibility constraints/UI contexts
+  (VSSDK) instead of showing a command that fails at execution time.
+
+Quick acceptance checks before shipping:
+
+1. Can a new user find the command where they naturally expect it?
+2. Is the command absent from irrelevant contexts?
+3. Does disabled state explain *why* it is disabled when possible?
+4. Is there exactly one primary place to invoke it?
 
 Official references:
 
@@ -551,6 +624,152 @@ Remote UI differs from ordinary WPF:
 - communicate from UI to extension through async commands and binding;
 - the XAML is instantiated in the Visual Studio process, not in the extension host process.
 
+#### Serializable types in a Remote UI data context
+
+Only data the Remote UI infrastructure can replicate into the proxy living in the Visual Studio process can be bound. The serializable set is:
+
+- primitive data (most .NET numeric types, enums, `bool`, `string`, `DateTime`);
+- extension-defined types marked with `[DataContract]` whose `[DataMember]` properties are themselves serializable;
+- objects implementing `IAsyncCommand` (surfaced as `ICommand` in the Visual Studio process);
+- `XamlFragment`, `SolidColorBrush`, and `Color` values;
+- `Nullable<>` of a serializable type;
+- collections of serializable types, including observable collections (`ObservableList<T>`).
+
+### Remote UI worked example
+
+A *remote user control* is defined across four files: a command that opens the tool window, the `ToolWindow`, the `RemoteUserControl`, and its XAML. The control automatically loads the embedded XAML resource that shares its type name.
+
+Data context (the MVVM *ViewModel*). Extend `NotifyPropertyChangedObject` to get `SetProperty`/`INotifyPropertyChanged` for observable members, and expose user actions as `AsyncCommand` rather than event handlers:
+
+```csharp
+using System.Runtime.Serialization;
+using Microsoft.VisualStudio.Extensibility.UI;
+
+[DataContract]
+internal sealed class MyToolWindowData : NotifyPropertyChangedObject
+{
+    public MyToolWindowData()
+    {
+        HelloCommand = new((parameter, cancellationToken) =>
+        {
+            Text = $"Hello {Name}!";
+            return Task.CompletedTask;
+        });
+    }
+
+    private string _name = string.Empty;
+
+    [DataMember]
+    public string Name
+    {
+        get => _name;
+        set => SetProperty(ref _name, value);
+    }
+
+    private string _text = string.Empty;
+
+    [DataMember]
+    public string Text
+    {
+        get => _text;
+        set => SetProperty(ref _text, value);
+    }
+
+    [DataMember]
+    public AsyncCommand HelloCommand { get; }
+}
+```
+
+Remote user control. The data context is passed to the base constructor (the `DataContext` property is read-only; the root object cannot be swapped, though its members can change). Use `ControlLoadedAsync` for initialization that depends on the UI being attached, and override `Dispose` for cleanup:
+
+```csharp
+using Microsoft.VisualStudio.Extensibility.UI;
+
+internal sealed class MyToolWindowContent : RemoteUserControl
+{
+    public MyToolWindowContent()
+        : base(dataContext: new MyToolWindowData())
+    {
+    }
+
+    public override async Task ControlLoadedAsync(CancellationToken cancellationToken)
+    {
+        await base.ControlLoadedAsync(cancellationToken);
+        // Initialize data that can change independently of UI events here.
+    }
+}
+```
+
+XAML. A remote user control is a single `DataTemplate` using the Remote UI namespace. It is normal WPF XAML with no code-behind; the `IAsyncCommand` is bound as a regular `ICommand`:
+
+```xml
+<DataTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+              xmlns:vs="http://schemas.microsoft.com/visualstudio/extensibility/2022/xaml">
+    <StackPanel Orientation="Vertical">
+        <TextBox Text="{Binding Name, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+        <Button Content="Say hello" Command="{Binding HelloCommand}" />
+        <TextBlock Text="{Binding Text}" />
+    </StackPanel>
+</DataTemplate>
+```
+
+Mark the XAML as an embedded resource (not a WPF `Page`) so Remote UI can load it:
+
+```xml
+<ItemGroup>
+  <EmbeddedResource Include="MyToolWindowContent.xaml" />
+  <Page Remove="MyToolWindowContent.xaml" />
+</ItemGroup>
+```
+
+Tool window. Return the control from `GetContentAsync`; a separate command opens it via `ShellExtensibility.ShowToolWindowAsync`:
+
+```csharp
+[VisualStudioContribution]
+internal sealed class MyToolWindow : ToolWindow
+{
+    private readonly MyToolWindowContent _content = new MyToolWindowContent();
+
+    public MyToolWindow(VisualStudioExtensibility extensibility)
+        : base(extensibility)
+    {
+        Title = "My Tool Window";
+    }
+
+    public override ToolWindowConfiguration ToolWindowConfiguration => new()
+    {
+        Placement = ToolWindowPlacement.DocumentWell,
+    };
+
+    public override Task<IRemoteUserControl> GetContentAsync(CancellationToken cancellationToken)
+    {
+        return Task.FromResult<IRemoteUserControl>(_content);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            _content.Dispose();
+        }
+
+        base.Dispose(disposing);
+    }
+}
+```
+
+The end-to-end flow: the control binds to a *proxy* of the data context inside the Visual Studio process; typing updates `Name` on the proxy, which propagates to `MyToolWindowData` in the extension host; clicking the button executes `HelloCommand` asynchronously in the host, which updates the observable `Text`, which propagates back to the proxy and refreshes the bound `TextBlock`. Because every hop is asynchronous and crosses a process boundary, prefer capturing values via command parameters at click time over assuming a shared object graph updates instantly.
+
+For ownership rules with dialogs (`ShowDialogAsync` transfers ownership of the control to Visual Studio, so the extension must not dispose it), context menus, and images, see the advanced Remote UI references below.
+
+Official references:
+
+- Why Remote UI (tutorial): <https://learn.microsoft.com/visualstudio/extensibility/visualstudio.extensibility/inside-the-sdk/remote-ui>
+- Other Remote UI concepts (context menus, images): <https://learn.microsoft.com/visualstudio/extensibility/visualstudio.extensibility/inside-the-sdk/other-remote-ui>
+- Tool windows: <https://learn.microsoft.com/visualstudio/extensibility/visualstudio.extensibility/tool-window/tool-window>
+- Dialogs: <https://learn.microsoft.com/visualstudio/extensibility/visualstudio.extensibility/dialog/dialog>
+
 ### Tool windows
 
 Tool windows are dockable Visual Studio windows. In the new model, implement a `ToolWindow`, return a `RemoteUserControl`, and expose a command that calls `ShellExtensibility.ShowToolWindowAsync`.
@@ -645,6 +864,119 @@ Official references:
 - <https://learn.microsoft.com/visualstudio/extensibility/managing-multiple-threads-in-managed-code>
 - <https://learn.microsoft.com/visualstudio/extensibility/vsix/publish/checklist#adhere-to-threading-rules>
 - <https://learn.microsoft.com/visualstudio/extensibility/internals/registering-vspackages>
+
+### In-process VisualStudio.Extensibility and bridging VSSDK/MEF services
+
+When the new SDK does not yet cover a scenario, you do not have to drop back to a full VSSDK package. `VisualStudio.Extensibility` extensions can run *in-process*, which keeps the modern SDK programming model while giving access to VSSDK and MEF services to cover the feature gap. The trade-off is that an in-process extension shares the Visual Studio process, so it loses process isolation and must target .NET Framework, and it must obey the same UI-thread rules as VSSDK code. Before choosing in-process hosting, check whether the functionality you need is reachable as a [brokered service](#brokered-services), which keeps the extension out-of-process and isolated.
+
+To host the new model in-process, set `RequiresInProcessHosting` to `true` on the extension and (for an existing VSSDK project) enable VSSDK compatibility:
+
+```csharp
+[VisualStudioContribution]
+internal sealed class ExtensionEntrypoint : Extension
+{
+    public override ExtensionConfiguration ExtensionConfiguration => new()
+    {
+        RequiresInProcessHosting = true,
+    };
+}
+```
+
+```xml
+<PropertyGroup>
+  <!-- Enables VSSDK features for compatibility in a new-model project. -->
+  <VssdkCompatibleExtension>true</VssdkCompatibleExtension>
+</PropertyGroup>
+```
+
+When adding new-model parts (commands, tool windows, editor listeners) to an *existing* VSSDK extension, also declare the combined extension type in `source.extension.vsixmanifest`:
+
+```xml
+<Installation ExtensionType="VSSDK+VisualStudio.Extensibility">
+```
+
+Consume Visual Studio SDK services through .NET dependency injection rather than `GetServiceAsync`/MEF imports directly. The `AsyncServiceProviderInjection<TService, TInterface>` and `MefInjection<TService>` classes (namespace `Microsoft.VisualStudio.Extensibility.VSSdkCompatibility`) let you inject those services into the constructor of a DI-created part:
+
+```csharp
+[VisualStudioContribution]
+internal sealed class MyCommand : Command
+{
+    private readonly MefInjection<IBufferTagAggregatorFactoryService> _tagAggregatorFactory;
+    private readonly AsyncServiceProviderInjection<DTE, DTE2> _dte;
+
+    public MyCommand(
+        MefInjection<IBufferTagAggregatorFactoryService> tagAggregatorFactory,
+        AsyncServiceProviderInjection<DTE, DTE2> dte)
+    {
+        _tagAggregatorFactory = tagAggregatorFactory;
+        _dte = dte;
+    }
+}
+```
+
+For in-process parts that must touch the UI thread, the framework also injects `JoinableTaskFactory` and `JoinableTaskContext`; use them to switch to the main thread without deadlocking, exactly as VSSDK code does. Prefer services offered directly by the `VisualStudio.Extensibility` SDK first, and reach for these bridges only for the missing API.
+
+Official references:
+
+- <https://learn.microsoft.com/visualstudio/extensibility/visualstudio.extensibility/get-started/in-proc-extensions>
+- <https://learn.microsoft.com/visualstudio/extensibility/visualstudio.extensibility/inside-the-sdk/dependency-injection#additional-services-for-in-process-extensions>
+
+### Brokered services
+
+Brokered services are the RPC mechanism that lets out-of-process extensions call into Visual Studio (and lets components call each other) across process boundaries. They are the preferred way to consume Visual Studio functionality that is not surfaced directly by the `VisualStudio.Extensibility` SDK convenience APIs, because they work from the isolated extension host without requiring in-process hosting.
+
+A brokered service is acquired from an `IServiceBroker` as a strongly typed proxy. In a `VisualStudio.Extensibility` extension, inject the broker directly (the SDK registers it in the extension's dependency-injection graph) and request well-known services from `VisualStudioServices`:
+
+```csharp
+using Microsoft.ServiceHub.Framework;
+using Microsoft.VisualStudio.RpcContracts.FileSystem;
+
+internal sealed class MyComponent
+{
+    private readonly IServiceBroker _serviceBroker;
+
+    public MyComponent(IServiceBroker serviceBroker)
+    {
+        _serviceBroker = serviceBroker;
+    }
+
+    public async Task UseServiceAsync(CancellationToken cancellationToken)
+    {
+        IFileSystem? fileSystem = await _serviceBroker.GetProxyAsync<IFileSystem>(
+            VisualStudioServices.VS2022.FileSystem,
+            cancellationToken);
+
+        try
+        {
+            if (fileSystem is not null)
+            {
+                // Call methods on the proxy.
+            }
+        }
+        finally
+        {
+            // Always dispose the proxy when finished with it.
+            (fileSystem as IDisposable)?.Dispose();
+        }
+    }
+}
+```
+
+Rules and caveats:
+
+- a service is identified by a `ServiceRpcDescriptor` (the well-known ones live on `VisualStudioServices`, grouped by Visual Studio version such as `VS2022`); choose the lowest version that exposes the API you need so the extension runs on more Visual Studio builds;
+- `GetProxyAsync<T>` returns `null` when the service is unavailable (wrong version, not activated, or not installed) — always null-check rather than assuming success;
+- the returned proxy is disposable; dispose it (`(proxy as IDisposable)?.Dispose()`) when you are done, because it owns an RPC channel. Do not cache a proxy for the lifetime of the extension and reuse it indefinitely — acquire it close to use, or re-acquire after disposal;
+- proxies are not guaranteed thread-safe; do not call a single proxy concurrently from multiple threads;
+- arguments and return values must be serializable by the RPC layer; pass data contracts, not live object graphs;
+- to author your own brokered service, define an interface contract, a `ServiceRpcDescriptor`, register it with `ProvideBrokeredServiceAttribute` or `ExportBrokeredServiceAttribute`, proffer it through `IBrokeredServiceContainer` or MEF, and let consumers acquire it through their own `IServiceBroker`.
+
+Official references:
+
+- <https://learn.microsoft.com/visualstudio/extensibility/use-and-provide-brokered-services>
+- <https://learn.microsoft.com/visualstudio/extensibility/internals/brokered-service-essentials>
+- <https://learn.microsoft.com/visualstudio/extensibility/how-to-consume-brokered-service>
+- <https://learn.microsoft.com/visualstudio/extensibility/how-to-provide-brokered-service>
 
 ### Community Toolkit rules
 
@@ -1060,6 +1392,221 @@ Guidelines:
 - never block IDE startup while reading remote config;
 - document all remote endpoints.
 
+### Configuration precedence model
+
+When an extension can read configuration from multiple channels, document and
+implement a deterministic precedence order. A practical default is:
+
+1. command/session override (if your extension supports it);
+2. workspace/repository configuration (if applicable);
+3. user settings/options page values;
+4. remote feature flags/config;
+5. built-in defaults.
+
+Rules:
+
+- keep precedence stable across releases;
+- if two channels define the same value, log which source won in diagnostic
+  output;
+- avoid hidden precedence (for example, environment variables silently overriding
+  user settings) unless explicitly documented;
+- test conflict scenarios (same key set in multiple sources).
+
+### Settings migration and versioning
+
+Treat settings schema as a versioned contract.
+
+- keep stable setting keys when possible;
+- when a setting is renamed, support old-key fallback for at least one release;
+- when a setting is removed, map it to a safe replacement or ignore it
+  explicitly;
+- perform migration once at startup/initialization, then persist migrated values;
+- include migration notes in release notes for enterprise users who script
+  settings deployment.
+
+For VSSDK options pages, changing property names or types can break persisted
+values. For VisualStudio.Extensibility settings, changing setting identifiers can
+orphan existing user values. Prefer additive evolution over destructive
+renaming.
+
+### User-facing configuration surfaces
+
+A production extension should expose configuration in a place users naturally
+expect, and the surface depends on the extensibility model.
+
+#### VSSDK / in-process options pages
+
+For VSSDK packages, the standard user-facing configuration entry point is
+**Tools > Options** via a `DialogPage` registered with
+`[ProvideOptionPage]`.
+
+- Use `DialogPage` for straightforward property-grid settings.
+- Use `UIElementDialogPage` or an overridden `Window` only when a custom UI is
+  necessary.
+- Keep one logical options page per scenario (general, advanced, diagnostics),
+  not one giant page with mixed concerns.
+- Register each page explicitly with `[ProvideOptionPage]` so it appears under
+  a predictable category/subcategory.
+
+This keeps settings discoverable, scriptable (where automation is used), and
+consistent with other Visual Studio features.
+
+Example (`DialogPage` + `[ProvideOptionPage]`):
+
+```csharp
+using System.ComponentModel;
+using Microsoft.VisualStudio.Shell;
+
+internal sealed class DiagnosticsOptionsPage : DialogPage
+{
+    [Category("Logging")]
+    [DisplayName("Enable diagnostic logging")]
+    [Description("Enables extension diagnostic logging.")]
+    public bool EnableDiagnosticLogging { get; set; }
+
+    [Category("Logging")]
+    [DisplayName("Log level")]
+    [Description("Error, Warning, Information, or Verbose.")]
+    public string LogLevel { get; set; } = "Warning";
+}
+
+[PackageRegistration(UseManagedResourcesOnly = true, AllowsBackgroundLoading = true)]
+[ProvideOptionPage(
+    typeof(DiagnosticsOptionsPage),
+    "My Extension",
+    "Diagnostics",
+    0,
+    0,
+    true)]
+internal sealed class MyPackage : AsyncPackage
+{
+    internal DiagnosticsOptionsPage Options =>
+        (DiagnosticsOptionsPage)GetDialogPage(typeof(DiagnosticsOptionsPage));
+}
+```
+
+#### VisualStudio.Extensibility settings API
+
+For out-of-process extensions, define settings with
+`[VisualStudioContribution]` categories and setting definitions, then read/monitor
+values via the settings APIs/observers.
+
+- Keep display names and descriptions localized because users see them in UI.
+- Add descriptions and validation metadata so users understand what each setting
+  does before changing it.
+- Group settings into clear categories; avoid dumping unrelated switches into a
+  single category.
+- Use observers/subscriptions for live updates so changes apply without restart
+  when feasible.
+
+The key principle is the same as VSSDK: put user-facing configuration in a
+stable, discoverable UI instead of hidden files or undocumented command-line
+flags.
+
+Example (`[VisualStudioContribution]` settings):
+
+```csharp
+#pragma warning disable VSEXTPREVIEW_SETTINGS
+
+using Microsoft.VisualStudio.Extensibility;
+
+internal sealed class ExtensionEntrypoint : Extension
+{
+    [VisualStudioContribution]
+    internal static SettingCategory DiagnosticsCategory { get; } =
+        new("diagnostics", "Diagnostics");
+
+    [VisualStudioContribution]
+    internal static Setting.Boolean EnableDiagnosticLogging { get; } =
+        new(
+            "enableDiagnosticLogging",
+            "Enable diagnostic logging",
+            DiagnosticsCategory,
+            defaultValue: false)
+        {
+            Description = "Enables extension diagnostic logging.",
+        };
+
+    [VisualStudioContribution]
+    internal static Setting.Enum LogLevel { get; } =
+        new(
+            "logLevel",
+            "Log level",
+            DiagnosticsCategory,
+            defaultValue: "Warning",
+            values: ["Error", "Warning", "Information", "Verbose"])
+        {
+            Description = "Controls diagnostic log verbosity.",
+        };
+}
+```
+
+Reading a value in a command handler:
+
+```csharp
+var result = await Extensibility.Settings().ReadEffectiveValueAsync(
+    ExtensionEntrypoint.EnableDiagnosticLogging,
+    cancellationToken);
+
+var enabled = result.ValueOrDefault(defaultValue: false);
+```
+
+### Configurable diagnostic logging
+
+Diagnostic logging should be configurable, because always-on verbose logging can
+hurt performance, increase noise, and capture more operational data than a user
+expects.
+
+Recommended pattern:
+
+1. Expose a user setting such as `DiagnosticLoggingEnabled` and a log verbosity
+   level (`Error`, `Warning`, `Information`, `Verbose`).
+2. Default to conservative logging (`Error`/`Warning`), and require explicit
+   opt-in for verbose traces.
+3. Apply setting changes dynamically where possible (no IDE restart required).
+4. Clearly document where logs are written (`%TEMP%\\VSLogs` for
+   VisualStudio.Extensibility traces, `ActivityLog.xml` for host/package issues)
+   and what they may contain.
+5. Add a command/button to open the log location or copy diagnostic info, so
+   support requests are easier to fulfill.
+
+Privacy and governance implications:
+
+- treat logging configuration as part of your privacy contract;
+- avoid logging source code, secrets, or full file contents by default;
+- if verbose mode can include sensitive values, say so directly in the option
+  description;
+- include log-level and logging-enabled state in support bundles so reports are
+  interpretable.
+
+### Self-documenting and help discoverability
+
+Extensions should be self-documented in-product, not only in Marketplace text.
+At minimum, users should be able to discover what the extension does, how to
+configure it, and where to get support without leaving Visual Studio blindly.
+
+Practical help surfaces:
+
+- a **Help** command (for example under Extensions menu or your extension menu)
+  that opens online docs/release notes/support;
+- concise descriptions for commands, settings, and options-page fields;
+- a short "Getting started" section in a tool window or first-run prompt;
+- a diagnostics/help command that collects version, configuration summary, and
+  log locations for support tickets;
+- Marketplace overview/license/privacy/support links kept in sync with in-product
+  help text.
+
+Treat documentation as a feature with versioning discipline: when behavior,
+settings, or troubleshooting steps change, update both Marketplace content and
+in-product help entry points in the same release.
+
+Official references:
+
+- VisualStudio.Extensibility settings: <https://learn.microsoft.com/visualstudio/extensibility/visualstudio.extensibility/settings/settings>
+- Create options pages (`DialogPage`, `ProvideOptionPageAttribute`): <https://learn.microsoft.com/visualstudio/extensibility/internals/creating-options-pages>
+- Options and options pages (VSSDK): <https://learn.microsoft.com/visualstudio/extensibility/internals/options-and-options-pages>
+- Logging extension diagnostics: <https://learn.microsoft.com/visualstudio/extensibility/visualstudio.extensibility/inside-the-sdk/logging>
+
 ## 14. Testing strategy
 
 Testing a Visual Studio extension is harder than testing a normal library because part of the product is the IDE host itself. Use a layered strategy.
@@ -1175,6 +1722,27 @@ Official reference: <https://learn.microsoft.com/visualstudio/extensibility/visu
 ### Activity log
 
 For in-process and host-level issues, start Visual Studio with `/log` and inspect `ActivityLog.xml` under the Visual Studio instance's application data folder. This is especially useful for package load failures, MEF composition failures, VSIX installation issues, and UI delay IDs.
+
+### Support bundle template
+
+To reduce back-and-forth in support tickets, publish a fixed "support bundle"
+checklist and ask users to attach it unchanged.
+
+Minimum bundle:
+
+- extension version;
+- Visual Studio version/edition/channel;
+- `ActivityLog.xml` (captured with `devenv /log` after repro);
+- `%TEMP%\\VSLogs\\*.svclog` (for out-of-process extensions);
+- clear repro steps with expected vs actual behavior;
+- whether the issue reproduces in a reset Experimental Instance;
+- if relevant, screenshots or short recording.
+
+Optional but high-value:
+
+- installed extension list (to detect conflicts);
+- exported extension settings/options values (with secrets removed);
+- solution characteristics (size, project count, target frameworks).
 
 ### Diagnosing issues reported after publishing
 
@@ -1335,6 +1903,127 @@ Example publish manifest shape:
 
 The documented `priceCategory` values are `free`, `trial`, and `paid`. See: <https://learn.microsoft.com/visualstudio/extensibility/walkthrough-publishing-a-visual-studio-extension-via-command-line#publishmanifest-file>.
 
+### CI/CD automation for publishing
+
+Treat publishing as a gated release pipeline, not a single script step. A robust
+pipeline usually has these stages:
+
+1. **Build and package**
+   - restore, build, and run tests;
+   - produce the Release VSIX artifact;
+   - validate manifest/version consistency and required package assets.
+2. **Quality and compliance gates**
+   - run packaged VSIX smoke checks (preferably in a clean environment);
+   - run dependency/license/security checks;
+   - fail before publish if any gate is red.
+3. **Channel routing**
+   - decide target channel from branch/tag/release ring policy (public
+     Marketplace, private Marketplace, or enterprise/internal channel).
+4. **Publish**
+   - execute `VsixPublisher.exe publish` non-interactively;
+   - use a publish manifest generated/validated by the pipeline;
+   - pass authentication via secure CI secrets, never from repo files.
+5. **Post-publish verification**
+   - verify listing/version visibility;
+   - run an install/update smoke check from the published artifact;
+   - emit release notes/notifications and archive immutable artifacts.
+
+Recommended CI/CD controls:
+
+- **Immutable artifacts**: publish exactly the VSIX produced by the validated
+  build stage; avoid rebuilding in the publish stage.
+- **Secret hygiene**: store PATs/tokens in the CI secret store and scope them to
+  minimum required permissions.
+- **Version discipline**: enforce monotonic version increments; never reuse a
+  version for hotfixes.
+- **Branch/tag policy**: allow publishing only from trusted release refs.
+- **Rollback readiness**: keep previous known-good artifact + unlist/hotfix
+  workflow ready (see rollback subsection below).
+- **Traceability**: persist commit SHA, pipeline run ID, artifact hash, publish
+  timestamp, and target channel in release metadata.
+
+A practical release-ring model:
+
+- **Ring 0**: internal/private publish for validation;
+- **Ring 1**: limited audience (pilot users/teams);
+- **Ring 2**: broad public release.
+
+This reduces blast radius when extension behavior differs across Visual Studio
+versions, workloads, or enterprise environments.
+
+### Distribution channels and monetization models
+
+Visual Studio Marketplace is the default public channel, but it is not the only
+viable distribution path. Choose channel strategy based on audience,
+compliance constraints, update governance, and monetization mechanics.
+
+#### Channel options
+
+| Channel | Typical audience | Discovery UX | Update UX | Governance profile |
+|---|---|---|---|---|
+| Visual Studio Marketplace (public) | Broad developer community | High (search inside VS + web listing) | Managed through Marketplace versions | Microsoft malware scanning + publisher verification + public metadata expectations |
+| Public direct VSIX distribution (website/GitHub Releases) | OSS users, niche tools, early adopters | Medium (you drive traffic externally) | Manual or custom update guidance | You own signing, integrity, and support workflow |
+| Private Marketplace listing | Controlled pilot groups | Low to medium (requires access) | Marketplace-backed for authorized users | Good for staged rollout before public release |
+| Closed enterprise registry/gallery/internal artifact portal | Enterprise-managed fleets | Low external discovery, high internal discoverability | IT-managed rollout cadence | Highest control for compliance, allow-lists, and approval workflows |
+| Bundled with enterprise installer / managed software deployment | Locked-down environments | Not self-discovery; distributed by IT catalog | Controlled by enterprise deployment system | Suitable when machines cannot install arbitrary VSIX from internet |
+
+Practical channel guidance:
+
+- use Marketplace for broad adoption and easier discoverability;
+- use private/internal channels when legal, data residency, or procurement rules
+  restrict public distribution;
+- keep the same product documentation quality regardless of channel
+  (overview, support, privacy, changelog), because enterprise users still need
+  auditability;
+- if you support both public and private channels, define whether versions ship
+  simultaneously or in staged rings.
+
+#### Monetization by channel
+
+Monetization design should align with the channel's trust and procurement model.
+
+| Monetization approach | Works best in | Notes |
+|---|---|---|
+| Marketplace `priceCategory=free` + optional donations/sponsorship | Public Marketplace, OSS | Lowest friction; monetize via support tiers/sponsorship rather than paywall pressure inside IDE |
+| Marketplace `trial` / `paid` listing + extension-side entitlement checks | Public Marketplace | Marketplace listing category is not a complete entitlement system; keep your own license validation architecture (Section 18) |
+| Free VSIX + paid cloud/service backend | Public or private | Common for AI/SaaS-backed extensions; extension is installable but premium features require service license |
+| Enterprise site license / contract distribution | Closed enterprise channels | Purchase and entitlement handled outside Marketplace; extension should support offline/proxy/license caching workflows |
+| Dual-channel (community free + enterprise paid) | Mixed audiences | Keep feature boundaries and support terms explicit to avoid confusion |
+
+Monetization/channel anti-patterns:
+
+- one pricing model in Marketplace text and a different one in-product;
+- trial expiration that blocks uninstall/export/help surfaces;
+- network-dependent entitlement checks on every command execution;
+- no enterprise path for offline/proxy-constrained customers.
+
+When channel and monetization are mixed (for example Marketplace public +
+enterprise private builds), keep three artifacts versioned together per release:
+
+1. technical package (VSIX),
+2. commercial terms (license/trial text),
+3. operational docs (support/privacy/update notes).
+
+### Update rollback and hotfix strategy
+
+Even with pre-publish testing, bad releases can happen. Define rollback before
+you need it.
+
+Recommended release controls:
+
+1. Keep the last known-good VSIX artifact and publish manifest in your release
+   storage.
+2. If a release is broken, unlist/private the bad version quickly and publish a
+   hotfix with incremented version rather than reusing the same version.
+3. Maintain a short rollback playbook (owner, steps, communication template,
+   verification checks).
+4. Post a clear status note in Marketplace overview/Q&A when a rollback or
+   hotfix is in progress.
+5. After recovery, add a regression test for the escaped defect.
+
+Do not change the VSIX ID during rollback/hotfix; update continuity depends on
+stable identity.
+
 ### Private deployment
 
 Options:
@@ -1354,6 +2043,33 @@ For enterprise environments, validate:
 - uninstall behavior;
 - update policy;
 - telemetry and privacy approval.
+
+### Closed enterprise registries and internal galleries
+
+In regulated or locked-down organizations, Marketplace may be disallowed even
+for free extensions. In that case, distribution usually moves to an internal
+software catalog, private extension gallery, or enterprise artifact registry.
+
+Enterprise rollout model:
+
+1. Security/compliance review of VSIX contents and dependencies.
+2. Internal signing/trust verification according to company policy.
+3. Publication to internal registry/catalog.
+4. Staged rollout rings (pilot team -> broader engineering org -> full fleet).
+5. Controlled rollback path to previous approved version.
+
+Operational requirements to document for enterprise consumers:
+
+- exact supported Visual Studio editions/versions;
+- required workloads/components;
+- whether internet access is required after install;
+- proxy and certificate requirements for licensing/telemetry/update checks;
+- support contact and SLA expectations;
+- explicit update cadence (for example monthly train vs ad-hoc hotfix).
+
+If your extension has both public and enterprise builds, clearly label build
+lineage (`Public`, `Enterprise`, `Gov`, etc.) and avoid ambiguous version labels
+that make support triage difficult.
 
 ### Marketplace protections
 
@@ -1448,6 +2164,63 @@ Architecture recommendations:
 - do not phone home on every command execution;
 - keep the extension useful enough to let users uninstall, export settings, or disable telemetry after expiration.
 
+### Open-source + commercial (dual licensing) policy
+
+A common model in developer tools is: source code is public, while enterprise use
+or enterprise-only capabilities are covered by commercial terms.
+
+Typical variants:
+
+| Model | Community terms | Commercial terms |
+|---|---|---|
+| Open source core + paid support/SLA | OSI license for code use/modification | Paid support, response SLA, compliance packaging, procurement-friendly terms |
+| Copyleft + commercial exception | Copyleft obligations for default use | Commercial license waives/replaces copyleft obligations for enterprise procurement |
+| Free community build + paid enterprise build/service | Free package for individuals/small teams | Paid entitlement for enterprise features, policy controls, or managed backend |
+
+Policy rules to keep this defensible:
+
+- keep license terms explicit in repository, Marketplace overview, and in-product
+  help;
+- state clearly what is free, what is paid, and what triggers commercial terms;
+- avoid ambiguous wording such as "free for personal use" without a precise
+  definition of commercial/organizational use;
+- keep technical behavior aligned with legal text (no hidden paywalls that are
+  not described in license docs);
+- publish a license FAQ for procurement/legal teams.
+
+### Commercial licensing when the author is an individual (physical person)
+
+An individual author can legally sell commercial licenses, but enterprise
+procurement usually requires more operational structure than community sales.
+
+Practical requirements enterprises often expect:
+
+1. A legal seller identity (your legal personal identity or a registered entity).
+2. Ability to issue invoices/receipts with tax information required by the
+   buyer's country.
+3. Contract documents (license terms, support terms, privacy notice,
+   data-processing terms when applicable).
+4. A payment channel acceptable to enterprises (wire, card, marketplace/vendor
+   platform, or approved reseller).
+5. Clear support and security contact points.
+
+If you sell as an individual, validate early:
+
+- whether your jurisdiction requires business registration or tax registration
+  once revenue crosses thresholds;
+- whether you must collect/remit VAT/GST/sales tax for digital goods/services;
+- whether target enterprise customers require vendor onboarding that is hard for
+  individuals (insurance, formal company data, compliance questionnaires).
+
+A common progression path:
+
+- phase 1: individual sales to small teams / early adopters;
+- phase 2: create a legal entity when enterprise demand requires stronger
+  procurement compatibility.
+
+This document is not legal or tax advice; use qualified legal/tax counsel for
+jurisdiction-specific obligations.
+
 ### Sponsorship and donations
 
 The Visual Studio Marketplace listing supports an overview document and a source code repository link. For open-source or donation-supported extensions, use those surfaces to disclose sponsorship options rather than building a payment flow into the IDE.
@@ -1486,6 +2259,339 @@ Telemetry rules:
 - never block IDE startup or editor operations;
 - avoid telemetry before privacy settings are known.
 
+Using telemetry to detect enterprise usage:
+
+- acceptable only when explicitly disclosed in privacy/licensing documents;
+- collect the minimum signal needed for business/operational purpose;
+- do not use covert fingerprinting techniques to infer organization identity;
+- do not gate core uninstall/help/export flows based on inferred telemetry;
+- provide enterprise-friendly controls (opt-out, proxy/offline behavior,
+  documented data fields);
+- prefer explicit commercial entitlement checks over inference from telemetry.
+
+A safer pattern is: telemetry for product quality + explicit license state for
+commercial enforcement.
+
+### License and telemetry disclosure templates
+
+Use the templates below as a starting point and adapt legal/tax/privacy wording
+to your jurisdiction and product model.
+
+#### Template A — README / repository `LICENSE-AND-PRIVACY.md`
+
+```markdown
+# License and Telemetry Notice
+
+## Licensing
+- Source code availability: This project is published with source code access.
+- Community usage: Community/non-commercial usage is governed by the terms in `LICENSE.md`.
+- Commercial/enterprise usage: Commercial or organizational usage may require a separate commercial license.
+- Support terms: Paid support/SLA terms are described in `SUPPORT.md`.
+
+For commercial licensing, contact: support@your-domain.example
+
+## Telemetry
+This extension may collect limited operational telemetry for quality and support.
+
+Collected data (example):
+- extension version
+- Visual Studio version/edition/channel
+- feature usage counters
+- error/failure events with correlation IDs
+
+Not collected by default:
+- source code contents
+- repository URLs
+- secrets/tokens
+- full file contents
+
+## Controls
+- Telemetry can be configured in extension settings.
+- Verbose diagnostics require explicit opt-in.
+- Enterprise/offline users can disable remote telemetry.
+
+## Privacy
+See `PRIVACY.md` for data categories, retention, opt-out, and contact details.
+```
+
+#### Template B — Marketplace overview snippet
+
+```markdown
+## License
+This extension is source-available/open-source for community usage under the repository license.
+Commercial or enterprise usage may require separate commercial terms.
+Contact: support@your-domain.example
+
+## Telemetry and Privacy
+The extension collects minimal operational telemetry (version, environment, usage/error counters)
+to improve quality and support.
+It does not collect source code contents or secrets by default.
+Telemetry behavior and opt-out controls are documented in the privacy notice:
+https://your-domain.example/privacy
+```
+
+#### Template C — In-product options page / settings description
+
+```text
+Telemetry level
+Controls diagnostics sent by the extension.
+- Off: no remote telemetry
+- Basic: anonymous usage and error counters
+- Diagnostic: extended troubleshooting telemetry (opt-in)
+
+No source code contents or secrets are transmitted by default.
+See Privacy Notice for details.
+```
+
+#### Template D — First-run disclosure prompt (concise)
+
+```text
+This extension can send minimal operational telemetry to improve reliability.
+You can choose Off, Basic, or Diagnostic now and change it later in settings.
+No source code contents are sent by default.
+```
+
+Template usage checklist:
+
+- keep terminology consistent across README, Marketplace, in-product settings,
+  and legal pages;
+- if commercial terms apply to enterprise usage, define "enterprise" in a
+  precise, non-ambiguous way;
+- keep contact channels current (sales/support/privacy);
+- version your disclosure text and update it in the same release where behavior
+  changes.
+
+### Commercial license FAQ template
+
+Use this FAQ template in `COMMERCIAL-LICENSE-FAQ.md` (or your docs site) and
+link it from Marketplace overview + in-product help.
+
+```markdown
+# Commercial License FAQ
+
+## 1) What counts as enterprise/commercial use?
+Commercial use means use by a legal entity (company, government, non-profit,
+or educational institution) for organizational work, client work, or
+revenue-generating activities.
+If your policy has exceptions (for example, OSS maintainers, students, or small
+teams), list them explicitly.
+
+## 2) Do contractors need separate licenses?
+State your policy clearly:
+- seat-based model: each human user needs a seat, including contractors;
+- organization model: contractors are covered when working under a licensed
+  organization.
+Also specify whether shared accounts are prohibited.
+
+## 3) Is the license per-user, per-device, per-project, or per-organization?
+Document exactly one primary metric and any secondary constraints.
+Examples:
+- per-user (named seat) with up to N devices;
+- per-organization up to N active developers;
+- per-project/repository with unlimited users in that scope.
+
+## 4) How do purchase and invoicing work?
+Describe:
+- available payment methods;
+- whether purchase orders are accepted;
+- invoice format and tax fields;
+- refund/cancellation terms;
+- contact email for procurement.
+
+## 5) Can an individual author sell commercial licenses?
+Yes. State seller legal identity and invoicing/tax handling details.
+If enterprise onboarding requires a legal entity, mention whether an authorized
+reseller/partner channel exists.
+
+## 6) Is offline or proxy-constrained activation supported?
+Document:
+- offline activation availability;
+- license cache duration;
+- renewal flow when internet is unavailable;
+- proxy/certificate requirements for online checks.
+
+## 7) What telemetry is used for licensing?
+Clarify separation between telemetry and entitlement:
+- telemetry for product quality/support;
+- explicit license state for commercial enforcement.
+List data categories and provide privacy notice link.
+
+## 8) What happens when a license expires?
+State behavior precisely:
+- which premium features are disabled;
+- what remains available (for example uninstall/help/export/config access);
+- grace period and reactivation flow.
+
+## 9) Are updates included?
+Describe update rights by plan:
+- all updates while subscription is active;
+- only patch updates;
+- major-version upgrades sold separately.
+
+## 10) What support is included?
+Document support channels and targets:
+- response time windows by plan (best effort / business day SLA / priority SLA);
+- security issue reporting path;
+- required support bundle artifacts.
+```
+
+FAQ governance checklist:
+
+- keep FAQ answers contract-consistent with license/EULA text;
+- update FAQ in the same release where pricing/license behavior changes;
+- include a "last updated" timestamp;
+- ensure sales/support contacts are monitored and tested periodically.
+
+### Telemetry schema governance
+
+Treat telemetry as a versioned contract so analytics and support queries remain
+stable across releases.
+
+- define a naming convention (`Area.EventName`) and keep names stable;
+- version event payloads explicitly when fields change;
+- classify fields (operational, product usage, potentially sensitive) and block
+  sensitive classes by default;
+- document retention windows and deletion policy per event class;
+- sample high-volume events rather than dropping them unpredictably;
+- include extension version, VS version/channel, and correlation ID in key
+  diagnostic events to support production triage.
+
+Keep telemetry specs in source control with code review, the same way you review
+public API changes.
+
+### Telemetry ingestion abuse protection
+
+If telemetry is sent to infrastructure you control, assume hostile or malformed
+traffic will occur. Design ingestion so spam is expensive for the attacker and
+cheap to discard for you.
+
+#### Threats to plan for
+
+- bot-driven high-rate event spam;
+- forged telemetry from non-extension clients;
+- replay of previously captured requests;
+- oversized or deeply nested payloads intended to exhaust CPU/memory;
+- high-cardinality payload values that poison analytics and storage.
+
+#### Layered controls
+
+1. **Authentication and transport**
+   - require HTTPS/TLS;
+   - require an extension-issued token per installation/user/org;
+   - support token revocation/rotation.
+2. **Rate limiting at multiple dimensions**
+   - per IP, per token/install ID, per organization/account, plus a global cap;
+   - enforce both request-rate and byte-rate limits;
+   - return `429` and require client backoff.
+3. **Strict schema validation**
+   - allowlist event names;
+   - enforce field types, max lengths, and max nesting depth;
+   - reject unknown critical fields and malformed payloads early.
+4. **Replay resistance**
+   - include timestamp + nonce in signed batches;
+   - reject stale timestamps and duplicate nonces in a replay window.
+5. **Ingestion isolation**
+   - front endpoint -> queue/buffer -> async processor -> storage;
+   - never write raw incoming payloads directly into primary analytics tables.
+
+#### Resource protection defaults
+
+Apply explicit limits before parsing business payloads:
+
+- max request body size;
+- max events per batch;
+- max string length per field;
+- max JSON depth;
+- request timeout and concurrent request cap.
+
+Fail closed for malformed traffic and fail open for extension UX (drop telemetry,
+do not block core extension functionality).
+
+#### Detection and response
+
+Detect and alert on:
+
+- sudden spikes per token/IP;
+- high invalid-schema ratio;
+- repeated replay/signature failures;
+- sudden high-cardinality dimensions (for example random IDs in event names).
+
+Automatic mitigations:
+
+- temporary token suspension;
+- IP cooldown/block rules;
+- dynamic sampling increase;
+- emergency "drop non-critical telemetry" mode.
+
+#### Baseline server-side policy (example values)
+
+These are starting points, not universal constants:
+
+- 120 requests/min per token;
+- 1 MB/min telemetry bytes per token;
+- 100 events per batch;
+- 64 KB max request body;
+- 10 levels max JSON depth;
+- 5-minute replay window for signed batches.
+
+Tune by observing real usage and keep thresholds in configuration, not hard-coded.
+
+#### Implementation notes for solo/SMB operators
+
+If telemetry currently goes directly to a home/self-hosted machine, add a managed
+front door first (API gateway/WAF/rate limiter) and keep your ingestion service
+behind it. This single step reduces abuse risk significantly.
+
+#### Incident playbook (minimum)
+
+1. Confirm abuse signal and affected dimensions (token/IP/event family).
+2. Activate emergency rate-limit/sampling profile.
+3. Revoke compromised tokens or block abusive clients.
+4. Preserve forensic summaries (not raw sensitive payloads).
+5. Publish status note if telemetry degradation affects support workflows.
+6. Add regression rules/tests so the same abuse pattern is auto-mitigated later.
+
+#### Recommended stack: mostly .NET + low ops + enterprise-friendly
+
+For teams building primarily on .NET who want minimal operational burden and
+enterprise-ready controls, a pragmatic baseline is:
+
+1. **Client instrumentation**
+   - use OpenTelemetry-compatible instrumentation in extension-adjacent services
+     (or minimal custom telemetry events from the extension itself);
+   - keep event schema explicit and versioned (see governance section above).
+2. **Managed front door**
+   - place an API gateway/WAF/rate limiter in front of ingestion;
+   - enforce auth, request size limits, and per-token/IP quotas before events
+     reach your backend.
+3. **Managed telemetry backend**
+   - use Azure Monitor Application Insights as storage/query/alert backend;
+   - note: Application Insights is active and supported as part of Azure Monitor
+     (not discontinued); modern usage increasingly favors OpenTelemetry-based
+     ingestion patterns.
+4. **Enterprise operations layer**
+   - documented privacy notice + data retention policy;
+   - proxy/offline behavior documentation;
+   - support bundle workflow tied to correlation IDs.
+
+Reference architecture (logical flow):
+
+`Extension -> HTTPS ingestion endpoint -> WAF/API gateway -> queue/buffer -> processor -> Azure Monitor / Application Insights`
+
+Why this stack is a strong default:
+
+- low ops compared with self-hosted observability clusters;
+- good .NET ecosystem fit and tooling familiarity;
+- enterprise-friendly controls (RBAC, retention configuration, auditing,
+  alerting, and integration with broader Azure governance).
+
+When to deviate:
+
+- strict sovereign/on-prem requirements may require internal SIEM/observability
+  platforms;
+- multi-cloud neutrality requirements may push toward OpenTelemetry Collector +
+  vendor-agnostic backends.
+
 Official reference: <https://learn.microsoft.com/visualstudio/extensibility/vsix/publish/checklist#add-privacy-notice>.
 
 ## 19. Security, privacy, and governance
@@ -1518,6 +2624,16 @@ Governance checklist:
 - keep a changelog;
 - have a security contact;
 - document support expectations.
+
+Dependency and binding reliability checklist (especially for VSSDK/hybrid):
+
+- pin and review transitive dependencies included in VSIX;
+- avoid shipping duplicate assembly versions under different paths in the VSIX;
+- validate satellite/resource assembly presence for localized UI;
+- test package load in a clean Experimental Instance to catch assembly binding
+  differences masked by dev machines;
+- when a load failure occurs, correlate `ActivityLog.xml` entries with package
+  dependency versions in the VSIX content.
 
 Marketplace publisher roles include Creator, Reader, Contributor, and Owner. See: <https://learn.microsoft.com/visualstudio/extensibility/walkthrough-publishing-a-visual-studio-extension#add-additional-users-to-manage-your-publisher-account>.
 
@@ -1566,6 +2682,19 @@ Keep stable:
 
 Changing identity values breaks updates, settings migration, user docs, enterprise allow-lists, and support scripts.
 
+### Settings compatibility across versions
+
+When extension settings evolve, compatibility issues can be more disruptive than
+API breaks because users notice them as behavior drift.
+
+- prefer additive changes (new settings with defaults) over renaming/removing
+  existing keys;
+- if a rename is unavoidable, support old-key read + new-key write for at least
+  one release cycle;
+- include a schema/version marker for complex serialized settings blobs;
+- document migration behavior in release notes and support docs;
+- add tests that upgrade from N-1 settings payloads to the current version.
+
 ## 21. Migration and hybrid architecture
 
 ### Migration goals
@@ -1584,7 +2713,7 @@ The end state for many modern extensions should be:
 3. Move non-Visual-Studio logic to shared libraries.
 4. Add unit tests around shared logic before changing host integration.
 5. Rebuild one command or tool window in `VisualStudio.Extensibility`.
-6. Keep unsupported features behind an in-process bridge.
+6. Keep unsupported features behind a bridge. First try a [brokered service](#brokered-services), which keeps the extension out-of-process. If the API is only reachable in-process, the lightest bridge is an *in-process* `VisualStudio.Extensibility` extension (`RequiresInProcessHosting = true`, `VssdkCompatibleExtension = true`) that injects the missing VSSDK/MEF service through `AsyncServiceProviderInjection`/`MefInjection` rather than a full separate VSSDK package. See the in-process hosting subsection in Section 10.
 7. Release incrementally and monitor crashes, UI delays, and user feedback.
 8. Remove VSSDK dependencies when the new SDK covers the remaining feature.
 
@@ -1825,6 +2954,16 @@ Check:
 - target framework;
 - synchronous service calls in `InitializeAsync`.
 
+Dependency/binding-specific checks:
+
+- verify the failing assembly version is present exactly once in the VSIX content;
+- check `ActivityLog.xml` for `FileNotFoundException`, `FileLoadException`,
+  or binding/MEF composition errors that name the missing assembly;
+- confirm localized resource/satellite assemblies exist when failures happen only
+  under specific UI languages;
+- compare the failing machine's installed extension set with a clean
+  Experimental Instance to detect extension-to-extension dependency conflicts.
+
 ### Users report UI delay notifications
 
 Check:
@@ -1897,6 +3036,13 @@ Before publishing or updating a Visual Studio extension:
 27. Protect publisher PATs and Marketplace owner permissions.
 28. Archive the exact VSIX that was published.
 29. Monitor Marketplace Q&A, ratings, crash reports, and support channels after release.
+30. Validate settings migration from at least one previous released version.
+31. Validate configuration precedence behavior when the same option is defined in multiple channels.
+32. Verify telemetry event schema/version updates are documented and backward compatible for dashboards/support queries.
+33. Rehearse rollback/hotfix steps (owner, unlist action, communication template, and publish of corrected version).
+34. Confirm distribution channel strategy for this release (public Marketplace, private Marketplace, direct VSIX, or enterprise registry) and ensure metadata/docs align with that channel.
+35. Confirm monetization terms shown in Marketplace/repository/in-product UI are consistent (free/trial/paid language, entitlement behavior, support terms).
+36. For enterprise/private channels, verify internal deployment artifacts and approval metadata are published together with the VSIX (release notes, compatibility matrix, support contact).
 
 ## 26. Key takeaways
 
