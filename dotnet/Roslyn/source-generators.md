@@ -225,7 +225,7 @@ internal sealed class GoodGenerator : IIncrementalGenerator
 
 ## 3. Recommended project configuration
 
-A generator project is usually an SDK-style class library targeting
+A generator project is an SDK-style class library targeting
 `netstandard2.0`:
 
 ```xml
@@ -713,6 +713,38 @@ compilation and cannot be made properly incremental.
 ## 7. Marker attributes
 
 A marker attribute is the most common way for users to opt into generation.
+
+### Alternatives for opting in and configuring generation
+
+Marker attributes are not the only opt-in/configuration channel. Depending on
+UX and hosting constraints, a generator can also use:
+
+- syntax or convention discovery (`CreateSyntaxProvider`) when user intent is
+  represented by code shape instead of an attribute;
+- `AdditionalFiles` for structured configuration (JSON/XML/YAML/templates);
+- `.editorconfig` / `.globalconfig` keys for human-editable policy;
+- MSBuild properties exposed via `CompilerVisibleProperty` for project-level
+  build facts and feature switches;
+- `AdditionalFiles` item metadata exposed via `CompilerVisibleItemMetadata`
+  when options belong to a specific file.
+
+A Fluent API is also a valid opt-in surface. In that model, users call an
+explicit configuration method chain in application composition code (for
+example DI setup), and the generator discovers those invocations through syntax
+and semantic matching.
+
+Use Fluent API when strongly typed configuration and IDE discoverability are
+more important than minimal discovery cost. Compared with marker attributes, it
+usually needs more careful symbol matching (method identity, overloads, and
+constant argument extraction) to stay robust under refactoring.
+
+No single channel is universally best. Pick one primary channel, document
+precedence if multiple channels are supported, and convert discovered inputs to
+small equatable models early so incremental caching remains effective.
+
+For configuration-channel guidance and precedence examples, see Section 12 and
+the Roslyn incremental generator cookbook:
+<https://github.com/dotnet/roslyn/blob/main/docs/features/incremental-generators.cookbook.md>.
 
 Design rules:
 
