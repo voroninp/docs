@@ -959,6 +959,14 @@ Most applications should start with a **`ValueConverter`**. A converter is enoug
 that EF and the provider already understand (for example, `OrderId` <-> `Guid`, or `Money` <-> `decimal`). Reach for custom relational type mapping
 only when you also need to control one or more of the following:
 
+```csharp
+modelBuilder.Entity<Order>()
+    .Property(x => x.OrderId)
+    .HasConversion(
+        id => id.Value,
+        value => new OrderId(value));
+```
+
 *   the exact store type name (`jsonb`, `geography`, `hierarchyid`, etc.)
 *   ADO.NET parameter configuration such as `DbType` or provider-specific parameter metadata
 *   SQL literal generation for migrations, default values, or inline constants
