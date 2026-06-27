@@ -1035,8 +1035,8 @@ optionsBuilder.ReplaceService<IMigrationsSqlGenerator, MyMigrationsSqlGenerator>
 optionsBuilder.ReplaceService<IMigrationsAnnotationProvider, MyMigrationsAnnotationProvider>();
 ```
 
-For a packaged `IDbContextOptionsExtension`, `ApplyServices` receives an `IServiceCollection`, not a `DbContextOptionsBuilder`. Register or replace
-internal services there with service-collection APIs:
+For a packaged `IDbContextOptionsExtension`, do this in `ApplyServices`, which works with `IServiceCollection`. Register or replace internal services
+there with service-collection APIs:
 
 ```csharp
 services.Replace(
