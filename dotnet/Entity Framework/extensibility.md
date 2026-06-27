@@ -157,7 +157,8 @@ caller. Treat interceptor code as production pipeline code, not as a best-effort
     the interceptor is intentionally suppressing an operation through EF's interception result APIs.
 *   **Keep side effects idempotent.** Retried commands or save operations can invoke the interceptor more than once. External side effects such as
     queue messages or HTTP calls should be avoided, guarded by idempotency keys, or moved outside the EF interceptor.
-*   **Use `[LoggerMessage]` for diagnostics.** Prefer structured logging over throwing broader exception messages that include support-only details.
+*   **Use structured logging for diagnostics.** In application interceptors, inject `ILogger<TInterceptor>` and prefer `[LoggerMessage]` for repeated log
+    messages instead of embedding support-only details in exception text.
 
 For example, a required tenant value should fail before a query or save can proceed:
 
@@ -832,8 +833,9 @@ public static DbContextOptionsBuilder UseMyExtension(
 
 ## 5. Logging and Diagnostics
 
-EF Core extensions should leverage the framework's internal `IDiagnosticsLogger<T>` rather than a standard `ILogger`. This ensures logs integrate with
-`DbContextOptions.LogTo()`, standard EF Core interceptors, and `DiagnosticSource` telemetry.
+For low-level EF Core extension/provider services, use the framework's internal `IDiagnosticsLogger<TCategoryName>` so diagnostics align with EF Core's
+event model and integrate with `DbContextOptions.LogTo()` and `DiagnosticSource` telemetry. For application interceptors, continue using standard
+`ILogger<TInterceptor>` from DI.
 
 ### Using `IDiagnosticsLogger<T>`
 Inject the logger using one of the pre-defined categories in `DbLoggerCategory`. For instance,
@@ -850,6 +852,29 @@ public sealed class MyExtensionService(
     }
 }
 ```
+
+### Which Logger to Use
+
+Choose the logger type based on where the code runs:
+
+*   **Application interceptors** (`IDbCommandInterceptor`, `ISaveChangesInterceptor`, etc.): use `ILogger<TInterceptor>` and optional
+    `[LoggerMessage]` source-generated methods.
+*   **EF Core extension/provider internals** (translators, model validators, SQL generators, extension services): use
+    `IDiagnosticsLogger<TCategoryName>`.
+
+`IDiagnosticsLogger<TCategoryName>` is not just an `ILogger` replacement; it also carries EF diagnostics context such as event definitions and
+`DiagnosticSource` access. This is why EF internal extension points often expose it directly in method signatures.
+
+### Category Selection Tips
+
+Use the closest `DbLoggerCategory` to the feature being implemented:
+
+*   `DbLoggerCategory.Database.Command` for command/SQL execution work.
+*   `DbLoggerCategory.Query` for translation and query pipeline behavior.
+*   `DbLoggerCategory.Model` or `DbLoggerCategory.Model.Validation` for model building/validation.
+*   `DbLoggerCategory.Infrastructure` for provider/extension infrastructure and setup paths.
+
+Matching categories keeps log filtering and `LogTo` output predictable for consumers.
 
 ### Emitting Telemetry
 To support APM tools like OpenTelemetry or Application Insights, emit events through `DiagnosticSource`:
