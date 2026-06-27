@@ -6,6 +6,25 @@ and test robust, AOT-friendly extensions for EF Core 10.
 
 ---
 
+## Contents
+
+1. [Extension Strategies](#1-extension-strategies)
+2. [Interceptors in EF Core 10](#2-interceptors-in-ef-core-10)
+3. [Dynamically Extending the Model](#3-dynamically-extending-the-model)
+4. [Internal vs. External Dependency Injection](#4-internal-vs-external-dependency-injection)
+5. [Logging and Diagnostics](#5-logging-and-diagnostics)
+6. [Query Translation (LINQ to SQL Customization)](#6-query-translation-linq-to-sql-customization)
+7. [Custom Type Mapping](#7-custom-type-mapping)
+8. [Migrations and SQL Generation](#8-migrations-and-sql-generation)
+9. [Design-Time vs. Run-Time](#9-design-time-vs-run-time)
+10. [Interoperability and Extension Safety](#10-interoperability-and-extension-safety)
+11. [Designing AOT-Friendly Extensions](#11-designing-aot-friendly-extensions)
+12. [Gotchas and Antipatterns](#12-gotchas-and-antipatterns)
+13. [Testing Extensions](#13-testing-extensions)
+14. [Sources and Further Reading](#sources-and-further-reading)
+
+---
+
 ## 1. Extension Strategies
 
 EF Core extensions generally fall into three categories based on the depth of framework integration required:
@@ -894,17 +913,14 @@ Custom SQL translators are only one query-extensibility option. Depending on the
 
 *   **Translate directly to SQL** by implementing and registering **`IMethodCallTranslatorPlugin`** or **`IMemberTranslatorPlugin`** when the
     method/property has a provider-specific SQL representation (for example, `string.StartsWith()` or a custom database function).
-*   **Substitute a method call or property access with another LINQ expression tree** when the helper is only a reusable .NET facade over logic EF can
-    already translate. In that model, you are not inventing a new SQL construct; you are expanding the helper's body into standard query nodes before
-    translation.
-*   **Rewrite queries globally with `IQueryExpressionInterceptor`** when you need a centralized hook that can inspect and modify the full LINQ
-    expression tree before EF compiles and translates it.
+*   **Substitute a method call or property access with another LINQ expression tree** using **`IQueryExpressionInterceptor`** when the helper is only
+    a reusable .NET facade over logic EF can already translate. Rather than substituting expressions manually, the interceptor expands the helper's
+    body into standard query nodes before translation—without inventing a new SQL construct.
 
 Choose the lightest mechanism that fits:
 
 *   If the target database needs a new SQL expression, use a translator plugin.
-*   If the logic can already be expressed in normal LINQ over mapped members, prefer expression substitution/inlining.
-*   If the rewrite is cross-cutting or must see the entire query tree, use `IQueryExpressionInterceptor`.
+*   If the logic can already be expressed in normal LINQ over mapped members, prefer expression substitution/inlining via `IQueryExpressionInterceptor`.
 
 ### Example: Method Call Translation
 Implement `IMethodCallTranslator` to return a `SqlFunctionExpression` or other `SqlExpression` representing the operation, then expose it via a
