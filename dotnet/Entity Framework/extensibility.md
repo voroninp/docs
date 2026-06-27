@@ -526,8 +526,15 @@ Extensions in the internal DI cannot see services in the application DI by defau
     ```
 
 2.  **Manual Bridging**: For application services not bridged automatically, prefer to inject a DI-created interceptor or options object into the
-    `DbContext` constructor and forward that existing instance to EF Core via `OnConfiguring`. Do not create a new interceptor instance in
-    `OnConfiguring`; doing so changes the options for each context instance and can cause internal service-provider bloat:
+    `DbContext` constructor and forward that existing instance to EF Core via `OnConfiguring`. Do not create a new **singleton interceptor** instance
+    inside `OnConfiguring`. `OnConfiguring` is called once per `DbContext` **instance** — not once per model — so it runs every time a context is
+    constructed, regardless of whether the model is already cached. Each call therefore produces a new interceptor object with a different identity.
+    EF Core includes singleton interceptor instances (`ISingletonInterceptor` implementations such as `IQueryExpressionInterceptor`,
+    `IMaterializationInterceptor`, and `IIdentityResolutionInterceptor`) in the `CoreOptionsExtension` service-provider hash. A new object identity
+    means a different hash, which causes a cache miss in `ServiceProviderCache`, which causes EF to build yet another internal service provider.
+    Enough misses trigger `ManyServiceProvidersCreatedWarning` and steadily grow memory. Ordinary per-context interceptors (`IDbCommandInterceptor`,
+    `ISaveChangesInterceptor`, etc.) are **not** included in the service-provider hash, so allocating them per-instance is merely wasteful, not a
+    cache-correctness problem:
 
     ```csharp
     public sealed class AppDbContext(
@@ -1154,6 +1161,21 @@ With EF Core 10's push for **Ahead-of-Time (AOT)** compatibility, extensions mus
     `src/EFCore/DbContextOptions.cs`, and `src/EFCore/Infrastructure/Internal/CoreOptionsExtension.cs` in the
     [dotnet/efcore repository](https://github.com/dotnet/efcore).
 
+    To surface this problem immediately during development rather than waiting for the warning to appear in logs, configure EF Core to throw an
+    exception whenever `ManyServiceProvidersCreatedWarning` fires:
+
+    ```csharp
+    services.AddDbContext((sp, options) =>
+        options.UseSqlServer(connectionString)
+               .ConfigureWarnings(w =>
+                   w.Throw(CoreEventId.ManyServiceProvidersCreatedWarning)));
+    ```
+
+    With this in place, the first context construction that would push the cache over the threshold throws an `InvalidOperationException` with a
+    message that identifies the option differences causing the bloat. Treat this as a test-environment default; it keeps the antipattern from
+    silently accumulating in staging before reaching production. In production, `Ignore` or `Log` is more appropriate unless you have automated
+    alerting on the log event.
+
     To discover whether a specific option, extension, or interceptor affects the service-provider cache key:
 
     1.  Check whether the type is registered through an `IDbContextOptionsExtension`. EF asks every extension's `Info` object for
@@ -1168,14 +1190,9 @@ With EF Core 10's push for **Ahead-of-Time (AOT)** compatibility, extensions mus
         `ShouldUseSameServiceProvider(...)`. If a value changes the services registered in `ApplyServices`, it belongs in the service-provider cache
         key. If it only affects runtime behavior after the provider is built, it usually does not. Use the implementation rules in
         [`DbContextOptionsExtensionInfo`](#dbcontextoptionsextensioninfo) to keep hash and equality behavior consistent.
-    5.  During development, configure EF to fail fast when cache bloat appears:
-
-        ```csharp
-        options.ConfigureWarnings(warnings =>
-            warnings.Throw(CoreEventId.ManyServiceProvidersCreatedWarning));
-        ```
-
-        Treat this warning as evidence that some service-provider-affecting option varies across otherwise equivalent context configurations.
+    5.  During development, configure EF to fail fast on this warning (see the snippet introduced above). Treat
+        `ManyServiceProvidersCreatedWarning` as evidence that some service-provider-affecting option varies across otherwise equivalent context
+        configurations.
 
     Wrong:
 
