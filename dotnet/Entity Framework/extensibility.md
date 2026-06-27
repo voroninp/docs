@@ -892,8 +892,8 @@ if (logger.DiagnosticSource.IsEnabled("MyExtension.EventName"))
 
 Custom SQL translators are only one query-extensibility option. Depending on the shape of the customization, you can:
 
-*   **Translate directly to SQL** with **`IMethodCallTranslatorPlugin`** or **`IMemberTranslatorPlugin`** when the method/property has a provider-specific
-    SQL representation (for example, `string.StartsWith()` or a custom database function).
+*   **Translate directly to SQL** by implementing and registering **`IMethodCallTranslatorPlugin`** or **`IMemberTranslatorPlugin`** when the
+    method/property has a provider-specific SQL representation (for example, `string.StartsWith()` or a custom database function).
 *   **Substitute a method call or property access with another LINQ expression tree** when the helper is only a reusable .NET facade over logic EF can
     already translate. In that model, you are not inventing a new SQL construct; you are expanding the helper's body into standard query nodes before
     translation.
