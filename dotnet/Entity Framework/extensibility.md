@@ -552,19 +552,89 @@ Extensions in the internal DI cannot see services in the application DI by defau
     interceptor has no scoped dependencies. Scoped interceptors are acceptable for context-specific application services, provided the same resolved
     instance is reused for the lifetime of the context.
 
-    For **per-call behavior** (values supplied immediately before `SaveChanges` / `SaveChangesAsync`), prefer a mutable context object scoped to a
-    single `DbContext` instance in EF Core's internal container, then set and clear that context around the save call. This avoids cross-talk when
-    multiple contexts exist in the same application request.
+    For **per-call behavior** — values that must flow from the call site into an interceptor for a single `SaveChanges` / `SaveChangesAsync`
+    invocation — use the **Ambient Context** pattern scoped to one `DbContext` instance:
 
-    A request-scoped application service (`AddScoped` in ASP.NET Core) is often too broad for this scenario because several `DbContext` instances can
-    share that request scope. In contrast, an EF internal scoped service is isolated to one context instance.
+    *   A mutable state object is registered as a **scoped** service inside EF Core's *internal* container (via
+        `IDbContextOptionsExtension.ApplyServices`). "Scoped" in EF's internal container means *per `DbContext` instance*, not per HTTP request.
+    *   The call site sets state on that object immediately before calling `SaveChanges` / `SaveChangesAsync`.
+    *   The interceptor reads state from the same object, which EF Core injects through constructor parameters.
+    *   A `finally` block clears state so pooled or long-lived contexts cannot leak it to the next operation.
 
-    Pattern summary:
+    **Why not use `AddScoped` in ASP.NET Core's container?** ASP.NET Core's request scope is shared by everything resolved during a single HTTP
+    request. If the application creates or resolves multiple `DbContext` instances within the same request — directly or through parallel work — they
+    all see the same scoped service instance. State written for one context is visible to the other, causing cross-talk. EF Core's internal scoped
+    service is isolated to exactly one `DbContext` instance, so no cross-talk is possible.
 
-    *   Register a context-state service with scoped lifetime in `IDbContextOptionsExtension.ApplyServices`.
-    *   In a `DbContext` extension method (or override), set state immediately before `SaveChanges` / `SaveChangesAsync`.
-    *   Read that state from `ISaveChangesInterceptor`.
-    *   Clear state in `finally` so pooled contexts cannot leak state to later operations.
+    The following example shows the complete pattern: a state object, a `DbContext` helper method that sets and clears the state, an interceptor that
+    reads it, and the registration wiring.
+
+    ```csharp
+    // 1. State object — one instance per DbContext instance.
+    public sealed class SaveChangesState
+    {
+        public string? OperationTag { get; set; }
+    }
+
+    // 2. DbContext extension method — sets state, saves, then clears state.
+    public static class AppDbContextExtensions
+    {
+        public static Task<int> SaveChangesWithTagAsync(
+            this AppDbContext context,
+            string operationTag,
+            CancellationToken cancellationToken = default)
+        {
+            var state = context.GetService<SaveChangesState>();
+            state.OperationTag = operationTag;
+            try
+            {
+                return context.SaveChangesAsync(cancellationToken);
+            }
+            finally
+            {
+                state.OperationTag = null; // prevent state leak in pooled contexts
+            }
+        }
+    }
+
+    // 3. Interceptor — reads state set by the call site.
+    public sealed class TaggedSaveInterceptor(SaveChangesState saveState)
+        : SaveChangesInterceptor
+    {
+        public override InterceptionResult<int> SavingChanges(
+            DbContextEventData eventData, InterceptionResult<int> result)
+        {
+            if (saveState.OperationTag is { } tag)
+            {
+                // Use tag — e.g., write an audit entry or set a command tag.
+            }
+            return result;
+        }
+
+        public override ValueTask<InterceptionResult<int>> SavingChangesAsync(
+            DbContextEventData eventData,
+            InterceptionResult<int> result,
+            CancellationToken cancellationToken = default)
+        {
+            if (saveState.OperationTag is { } tag)
+            {
+                // Use tag.
+            }
+            return new ValueTask<InterceptionResult<int>>(result);
+        }
+    }
+
+    // 4. Registration — both services are scoped to one DbContext instance.
+    // Call this inside IDbContextOptionsExtension.ApplyServices.
+    services.AddScoped<SaveChangesState>();
+    services.AddScoped<TaggedSaveInterceptor>();
+    // The interceptor must also be added to DbContextOptions, for example via
+    // a UseX method that calls options.AddInterceptors(sp.GetRequiredService<TaggedSaveInterceptor>())
+    // where sp is the EF Core internal service provider, not the application one.
+    ```
+
+    Because both `SaveChangesState` and `TaggedSaveInterceptor` are resolved from EF Core's internal scoped container, each `DbContext` instance
+    receives its own independent pair — the state written by one context cannot be read by another.
 
 3.  **Priority**: Options defined in **`OnConfiguring`** take highest priority and override any settings provided via the application DI. Use
     `OnConfiguring` only for settings specific to the context instance; otherwise it may inadvertently undo host-level configuration.
