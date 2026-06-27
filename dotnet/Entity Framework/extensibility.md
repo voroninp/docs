@@ -916,14 +916,11 @@ Custom SQL translators are only one query-extensibility option. Depending on the
 *   **Substitute a method call or property access with another LINQ expression tree** using **`IQueryExpressionInterceptor`** when the helper is only
     a reusable .NET facade over logic EF can already translate. Rather than substituting expressions manually, the interceptor expands the helper's
     body into standard query nodes before translation—without inventing a new SQL construct.
-*   **Rewrite queries globally with `IQueryExpressionInterceptor`** when you need a centralized hook that can inspect and modify the full LINQ
-    expression tree before EF compiles and translates it.
 
 Choose the lightest mechanism that fits:
 
 *   If the target database needs a new SQL expression, use a translator plugin.
 *   If the logic can already be expressed in normal LINQ over mapped members, prefer expression substitution/inlining via `IQueryExpressionInterceptor`.
-*   If the rewrite is cross-cutting or must see the entire query tree, use `IQueryExpressionInterceptor`.
 
 ### Example: Method Call Translation
 Implement `IMethodCallTranslator` to return a `SqlFunctionExpression` or other `SqlExpression` representing the operation, then expose it via a
