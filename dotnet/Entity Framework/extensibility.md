@@ -890,10 +890,21 @@ if (logger.DiagnosticSource.IsEnabled("MyExtension.EventName"))
 
 ## 6. Query Translation (LINQ to SQL Customization)
 
-To translate custom .NET methods (e.g., spatial functions, domain helpers) or properties into native SQL statements, you implement translator plugins.
+Custom SQL translators are only one query-extensibility option. Depending on the shape of the customization, you can:
 
-*   **`IMethodCallTranslatorPlugin`**: Translates methods (e.g., `string.StartsWith()` or a custom `ComputeHash()`).
-*   **`IMemberTranslatorPlugin`**: Translates properties (e.g., `DateTime.Now`).
+*   **Translate directly to SQL** by implementing and registering **`IMethodCallTranslatorPlugin`** or **`IMemberTranslatorPlugin`** when the
+    method/property has a provider-specific SQL representation (for example, `string.StartsWith()` or a custom database function).
+*   **Substitute a method call or property access with another LINQ expression tree** when the helper is only a reusable .NET facade over logic EF can
+    already translate. In that model, you are not inventing a new SQL construct; you are expanding the helper's body into standard query nodes before
+    translation.
+*   **Rewrite queries globally with `IQueryExpressionInterceptor`** when you need a centralized hook that can inspect and modify the full LINQ
+    expression tree before EF compiles and translates it.
+
+Choose the lightest mechanism that fits:
+
+*   If the target database needs a new SQL expression, use a translator plugin.
+*   If the logic can already be expressed in normal LINQ over mapped members, prefer expression substitution/inlining.
+*   If the rewrite is cross-cutting or must see the entire query tree, use `IQueryExpressionInterceptor`.
 
 ### Example: Method Call Translation
 Implement `IMethodCallTranslator` to return a `SqlFunctionExpression` or other `SqlExpression` representing the operation, then expose it via a
@@ -941,17 +952,52 @@ services.TryAddEnumerable(ServiceDescriptor.Singleton<IMethodCallTranslatorPlugi
 
 ## 7. Custom Type Mapping
 
-To map custom structs, classes, or domain-specific primitives (e.g., Strongly-Typed IDs, NodaTime) to database columns deeply, you can override
-relational type mappings.
+To map custom structs, classes, or domain-specific primitives (e.g., Strongly-Typed IDs, NodaTime, JSON wrapper types, provider-specific UDTs) to
+database columns deeply, you can override relational type mappings.
 
-*   Implement **`IRelationalTypeMappingSourcePlugin`** to interrogate type mapping requests (like checking if the CLR type is `MyCustomType`).
-*   Return a subclass of **`RelationalTypeMapping`** (or string/int mapping bases) that controls how parameter values are created for ADO.NET
-    (`CreateParameter`), and how data is read/written to the `DbDataReader`.
+Most applications should start with a **`ValueConverter`**. A converter is enough when you only need to transform one CLR value into another CLR value
+that EF and the provider already understand (for example, `OrderId` <-> `Guid`, or `Money` <-> `decimal`). Reach for custom relational type mapping
+only when you also need to control one or more of the following:
+
+```csharp
+modelBuilder.Entity<Order>()
+    .Property(x => x.OrderId)
+    .HasConversion(
+        id => id.Value,
+        value => new OrderId(value));
+```
+
+*   the exact store type name (`jsonb`, `geography`, `hierarchyid`, etc.)
+*   ADO.NET parameter configuration such as `DbType` or provider-specific parameter metadata
+*   SQL literal generation for migrations, default values, or inline constants
+*   provider-specific read/write behavior that a converter alone cannot express
+
+The extension point is **`IRelationalTypeMappingSourcePlugin`**. EF asks every registered plugin whether it can satisfy a mapping request. In your
+plugin:
+
+*   inspect the incoming mapping request (`ClrType`, store type name, Unicode/fixed-length/size/precision facets, and similar metadata)
+*   return `null` for requests you do not own so the provider's normal mapping pipeline can continue
+*   return a **`RelationalTypeMapping`** (or a more specific base such as the string, integer, or GUID relational mappings) for requests you do own
+
+Your custom **`RelationalTypeMapping`** is responsible for the relational details of the type, such as:
+
+*   store type name and facets
+*   the `CoreTypeMapping` pieces attached to it, including any `ValueConverter` and `ValueComparer`
+*   parameter creation/configuration for ADO.NET
+*   SQL literal rendering for non-parameterized constants
+*   cloning itself when EF needs the same mapping with different facets
+
+That last point is important: EF often reuses the same conceptual mapping with different sizes, precisions, or store-type names. A robust mapping type
+must preserve its behavior when cloned with updated parameters rather than assuming one fixed instance forever.
 
 Register the plugin exactly like the query translator:
 ```csharp
 services.TryAddEnumerable(ServiceDescriptor.Singleton<IRelationalTypeMappingSourcePlugin, MyTypeMappingPlugin>());
 ```
+
+In practice, provider/package authors use this extension point far more often than ordinary application code. If your goal is only to make one model
+property persist cleanly, prefer `.HasConversion(...)` or a value converter first. Use a full type-mapping plugin when you are effectively introducing
+or formalizing a database type for the provider.
 
 ---
 
